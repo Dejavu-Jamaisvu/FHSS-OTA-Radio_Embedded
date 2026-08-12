@@ -4,6 +4,7 @@
 /*
  * ota-protocol — firmware-esp32 <-> gateway-ota 공유 OTA 패킷 규격
  * v0.2 (2026-08-11) — RF/ESP32 담당 팀원의 plan_A.md 제안을 채택해서 다시 씀.
+ * 2026-08-11 후속: version 필드 제거(아래 "왜 version이 없는지" 참고).
  *
  * v0.1(9byte, DATA/ACK/NACK 3종류)은 폐기됨. 무엇이 왜 바뀌었는지는
  * docs/design-notes-ota-protocol-es.md "v0.2로 확정" 절 참고.
@@ -18,6 +19,23 @@
  * 이 패킷 포맷과 무관한 세션 레이어(`ota_client`/`gateway-ota`의 `OtaSession`)
  * 결정 사항이라 여기 포함하지 않습니다 — 어느 쪽으로 하든 같은 DATA/ACK/NACK
  * 포맷을 그대로 씁니다.
+ *
+ * 왜 version 필드가 없는지 (2026-08-11 결정):
+ * - 원래는 모든 패킷 맨 앞에 1byte 프로토콜 버전을 뒀었는데, 매직 넘버
+ *   도입을 검토하면서 "애초에 이 두 개가 막아주는 문제가 뭔지" 다시 따져봄.
+ * - `OTA_START`/`OTA_DATA`/`OTA_END`/`OTA_ACK`/`OTA_NACK`는 전부 `session_id`를
+ *   싣고 있고, 이미 진행 중인 세션이라면 session_id가 사실상 매직 넘버보다도
+ *   더 강력한 필터 역할을 함(고정된 공개값이 아니라 세션마다 랜덤하게 생기는
+ *   값이라 노이즈가 우연히 맞아떨어질 확률이 더 낮음).
+ * - `OTA_DISCOVER`/`OTA_DISCOVER_ACK`는 session_id가 없는 세션 시작 이전
+ *   단계라 무방비이긴 하지만, "조회"라는 낮은 위험도 작업이라 문제 없음 —
+ *   노이즈를 잘못 해석해도 최악의 경우 화면에 가짜 기기가 하나 뜨는
+ *   정도(재조회하면 그만)지, 실제 플래시 기록으로 이어지지 않음. CC1101
+ *   하드웨어 CRC가 1차로 걸러주기도 함.
+ * - 그래서 매직 넘버도, version도 둘 다 도입하지 않기로 결정. 다만 향후
+ *   "정말 다른 버전끼리 붙는" 상황(v0.1 vs v0.2처럼)을 다시 만나면, 그때는
+ *   session_id로도 못 막는 경우(세션 시작 전 START 패킷 자체의 오해석)라
+ *   재검토 필요.
  */
 
 #include <stdbool.h>
@@ -29,8 +47,6 @@
 extern "C" {
 #endif
 
-#define OTA_PROTOCOL_VERSION 1u
-
 /*
  * RF 상위 계층(rf_transport)이 보장하는 패킷 바디 최대 크기.
  * CC1101 하드웨어 FIFO(64byte) 자체가 아니라, RF 담당이 실측/오버헤드
@@ -38,13 +54,19 @@ extern "C" {
  */
 #define OTA_RF_PACKET_BODY_MAX_SIZE 60u
 
-#define OTA_DATA_HEADER_SIZE  13u
-#define OTA_MAX_PAYLOAD_SIZE  47u  /* OTA_RF_PACKET_BODY_MAX_SIZE - OTA_DATA_HEADER_SIZE */
-#define OTA_START_PACKET_SIZE 50u
-#define OTA_END_PACKET_SIZE   14u
-#define OTA_ACK_PACKET_SIZE   12u
-#define OTA_DISCOVER_PACKET_SIZE     2u  /* version+type 뿐, 바디 없음 */
-#define OTA_DISCOVER_ACK_PACKET_SIZE 8u  /* device_id(3) + fw_major/minor/patch */
+#define OTA_DATA_HEADER_SIZE  12u
+#define OTA_MAX_PAYLOAD_SIZE  48u  /* OTA_RF_PACKET_BODY_MAX_SIZE - OTA_DATA_HEADER_SIZE */
+#define OTA_START_PACKET_SIZE 49u
+#define OTA_END_PACKET_SIZE   13u
+#define OTA_ACK_PACKET_SIZE   11u
+#define OTA_DISCOVER_PACKET_SIZE     1u  /* type 뿐, 바디 없음 */
+#define OTA_DISCOVER_ACK_PACKET_SIZE 7u  /* device_id(3) + fw_major/minor/patch */
+
+/* `sequence`/`total_chunks`는 plan_A.md 원안대로 32bit 유지(2026-08-11).
+ * 한때 65,535개(16bit)면 충분해 보인다고 판단해 축소를 검토했으나, RF
+ * 담당 의견으로 "일단 여유 있게 32bit로 두고, 나중에 실제로 좁혀도 되는
+ * 게 확인되면 그때 줄이자"로 정리해 되돌림. 축소 검토 근거는
+ * docs/design-notes-ota-protocol-es.md에 기록만 남겨둠. */
 
 #define OTA_BROADCAST_DEVICE_ID 0xFFFFFFFFu
 /* START/END(제어 패킷)에 대한 ACK/NACK의 sequence 필드는 이 값을 씀
@@ -62,10 +84,11 @@ typedef enum {
     OTA_PKT_DISCOVER_ACK = 7,  /* 조회 응답 — MENU_OTA 대기중인 ESP32 각자 응답 */
 } ota_packet_type_t;
 
-/* ---------- ACK/NACK의 result_code ---------- */
+/* ---------- ACK/NACK의 result_code ----------
+ * (2026-08-11: version 필드를 없애면서 OTA_RESULT_INVALID_VERSION도 같이
+ * 제거함 — 더 이상 검증할 version이 없으므로) */
 typedef enum {
     OTA_RESULT_OK = 0,
-    OTA_RESULT_INVALID_VERSION,
     OTA_RESULT_INVALID_TYPE,
     OTA_RESULT_INVALID_SESSION,
     OTA_RESULT_INVALID_TARGET,
@@ -113,9 +136,15 @@ typedef struct {
 /* OTA_DISCOVER는 페이로드가 없어서(브로드캐스트 질의 자체) 별도 필드 구조체가
  * 없습니다. OTA_DISCOVER_ACK만 응답 기기 정보를 싣습니다. */
 typedef struct {
-    uint32_t device_id;   /* 이 기기의 고유 ID. 와이어에는 하위 3byte만 실림
-                            * (0 ~ OTA_DEVICE_ID_MAX), 상위 1byte는 항상 0이어야
-                            * 함 — OTA_START.target_device_id(4byte)에 그대로
+    uint32_t device_id;   /* 이 기기의 고유 ID. ESP32 MAC 주소(6byte)의
+                            * 뒤 3byte(NIC 고유 부분)를 그대로 씀 — 앞
+                            * 3byte(OUI, Organizationally Unique Identifier)는
+                            * 제조사 식별용이라 같은 제조사 칩끼리는 전부
+                            * 동일해서 기기 구분에 쓸모가 없음, 뒤 3byte만으로
+                            * 충분히 구분 가능(2026-08-11 결정). 와이어에는
+                            * 하위 3byte만 실림(0 ~ OTA_DEVICE_ID_MAX),
+                            * 상위 1byte는 항상 0이어야 함 —
+                            * OTA_START.target_device_id(4byte)에 그대로
                             * 넣을 때 자동으로 제로 확장(zero-extend)됨 */
     uint8_t  fw_major;
     uint8_t  fw_minor;
@@ -201,24 +230,23 @@ static inline uint32_t ota_protocol_total_chunks(uint32_t image_size)
 }
 
 /*
- * 수신한 바이트열의 맨 앞 2byte(version, type)만 먼저 들여다봅니다.
+ * 수신한 바이트열의 맨 앞 1byte(type)만 먼저 들여다봅니다.
  * 어떤 종류의 패킷인지 모를 때, 이걸로 먼저 타입만 확인한 뒤
  * 그에 맞는 ota_protocol_decode_*()를 호출하면 됩니다.
  */
 static inline bool ota_protocol_peek_type(
     const uint8_t *packet, size_t packet_length,
-    uint8_t *version_out, ota_packet_type_t *type_out)
+    ota_packet_type_t *type_out)
 {
-    if (packet == NULL || packet_length < 2)
+    if (packet == NULL || packet_length < 1)
         return false;
-    if (version_out) *version_out = packet[0];
-    if (type_out) *type_out = (ota_packet_type_t)packet[1];
+    if (type_out) *type_out = (ota_packet_type_t)packet[0];
     return true;
 }
 
 /* ================= OTA_START ================= */
-/* Offset 0:version 1:type 2:session_id(4) 6:target_device_id(4)
- * 10:image_size(4) 14:total_chunks(4) 18:image_sha256(32) = 50byte */
+/* Offset 0:type 1:session_id(4) 5:target_device_id(4)
+ * 9:image_size(4) 13:total_chunks(4) 17:image_sha256(32) = 49byte */
 
 static inline size_t ota_protocol_encode_start(
     uint8_t *packet_out, size_t packet_out_capacity,
@@ -229,13 +257,12 @@ static inline size_t ota_protocol_encode_start(
     if (packet_out_capacity < OTA_START_PACKET_SIZE)
         return 0;
 
-    packet_out[0] = (uint8_t)OTA_PROTOCOL_VERSION;
-    packet_out[1] = (uint8_t)OTA_PKT_START;
-    ota_write_u32_le(&packet_out[2],  fields->session_id);
-    ota_write_u32_le(&packet_out[6],  fields->target_device_id);
-    ota_write_u32_le(&packet_out[10], fields->image_size);
-    ota_write_u32_le(&packet_out[14], fields->total_chunks);
-    memcpy(&packet_out[18], fields->image_sha256, 32);
+    packet_out[0] = (uint8_t)OTA_PKT_START;
+    ota_write_u32_le(&packet_out[1],  fields->session_id);
+    ota_write_u32_le(&packet_out[5],  fields->target_device_id);
+    ota_write_u32_le(&packet_out[9],  fields->image_size);
+    ota_write_u32_le(&packet_out[13], fields->total_chunks);
+    memcpy(&packet_out[17], fields->image_sha256, 32);
 
     return OTA_START_PACKET_SIZE;
 }
@@ -246,23 +273,23 @@ static inline bool ota_protocol_decode_start(
 {
     if (packet == NULL || fields_out == NULL || packet_length != OTA_START_PACKET_SIZE)
         return false;
-    if (packet[0] != (uint8_t)OTA_PROTOCOL_VERSION || packet[1] != (uint8_t)OTA_PKT_START)
+    if (packet[0] != (uint8_t)OTA_PKT_START)
         return false;
 
     ota_start_fields_t fields;
-    fields.session_id       = ota_read_u32_le(&packet[2]);
-    fields.target_device_id = ota_read_u32_le(&packet[6]);
-    fields.image_size       = ota_read_u32_le(&packet[10]);
-    fields.total_chunks     = ota_read_u32_le(&packet[14]);
-    memcpy(fields.image_sha256, &packet[18], 32);
+    fields.session_id       = ota_read_u32_le(&packet[1]);
+    fields.target_device_id = ota_read_u32_le(&packet[5]);
+    fields.image_size       = ota_read_u32_le(&packet[9]);
+    fields.total_chunks     = ota_read_u32_le(&packet[13]);
+    memcpy(fields.image_sha256, &packet[17], 32);
 
     *fields_out = fields; /* 검증 통과 후에만 out 파라미터에 반영 */
     return true;
 }
 
 /* ================= OTA_DATA ================= */
-/* Offset 0:version 1:type 2:session_id(4) 6:sequence(4) 10:payload_length(1)
- * 11:crc16(2) 13:firmware payload(0~47) = 최대 60byte */
+/* Offset 0:type 1:session_id(4) 5:sequence(4) 9:payload_length(1)
+ * 10:crc16(2) 12:firmware payload(0~48) = 최대 60byte */
 
 static inline size_t ota_protocol_encode_data(
     uint8_t *packet_out, size_t packet_out_capacity,
@@ -279,12 +306,11 @@ static inline size_t ota_protocol_encode_data(
     const uint16_t crc = (payload_length > 0)
         ? ota_protocol_crc16(payload, payload_length) : 0u;
 
-    packet_out[0] = (uint8_t)OTA_PROTOCOL_VERSION;
-    packet_out[1] = (uint8_t)OTA_PKT_DATA;
-    ota_write_u32_le(&packet_out[2], session_id);
-    ota_write_u32_le(&packet_out[6], sequence);
-    packet_out[10] = (uint8_t)payload_length;
-    ota_write_u16_le(&packet_out[11], crc);
+    packet_out[0] = (uint8_t)OTA_PKT_DATA;
+    ota_write_u32_le(&packet_out[1], session_id);
+    ota_write_u32_le(&packet_out[5], sequence);
+    packet_out[9] = (uint8_t)payload_length;
+    ota_write_u16_le(&packet_out[10], crc);
     if (payload_length > 0)
         memcpy(&packet_out[OTA_DATA_HEADER_SIZE], payload, payload_length);
 
@@ -302,14 +328,14 @@ static inline bool ota_protocol_decode_data(
 {
     if (packet == NULL || header_out == NULL || packet_length < OTA_DATA_HEADER_SIZE)
         return false;
-    if (packet[0] != (uint8_t)OTA_PROTOCOL_VERSION || packet[1] != (uint8_t)OTA_PKT_DATA)
+    if (packet[0] != (uint8_t)OTA_PKT_DATA)
         return false;
 
     ota_data_header_fields_t header;
-    header.session_id     = ota_read_u32_le(&packet[2]);
-    header.sequence       = ota_read_u32_le(&packet[6]);
-    header.payload_length = packet[10];
-    header.crc16          = ota_read_u16_le(&packet[11]);
+    header.session_id     = ota_read_u32_le(&packet[1]);
+    header.sequence       = ota_read_u32_le(&packet[5]);
+    header.payload_length = packet[9];
+    header.crc16          = ota_read_u16_le(&packet[10]);
 
     if (header.payload_length > OTA_MAX_PAYLOAD_SIZE)
         return false;
@@ -330,7 +356,7 @@ static inline bool ota_protocol_decode_data(
 }
 
 /* ================= OTA_END ================= */
-/* Offset 0:version 1:type 2:session_id(4) 6:image_size(4) 10:total_chunks(4) = 14byte */
+/* Offset 0:type 1:session_id(4) 5:image_size(4) 9:total_chunks(4) = 13byte */
 
 static inline size_t ota_protocol_encode_end(
     uint8_t *packet_out, size_t packet_out_capacity,
@@ -341,11 +367,10 @@ static inline size_t ota_protocol_encode_end(
     if (packet_out_capacity < OTA_END_PACKET_SIZE)
         return 0;
 
-    packet_out[0] = (uint8_t)OTA_PROTOCOL_VERSION;
-    packet_out[1] = (uint8_t)OTA_PKT_END;
-    ota_write_u32_le(&packet_out[2],  fields->session_id);
-    ota_write_u32_le(&packet_out[6],  fields->image_size);
-    ota_write_u32_le(&packet_out[10], fields->total_chunks);
+    packet_out[0] = (uint8_t)OTA_PKT_END;
+    ota_write_u32_le(&packet_out[1], fields->session_id);
+    ota_write_u32_le(&packet_out[5], fields->image_size);
+    ota_write_u32_le(&packet_out[9], fields->total_chunks);
 
     return OTA_END_PACKET_SIZE;
 }
@@ -356,21 +381,21 @@ static inline bool ota_protocol_decode_end(
 {
     if (packet == NULL || fields_out == NULL || packet_length != OTA_END_PACKET_SIZE)
         return false;
-    if (packet[0] != (uint8_t)OTA_PROTOCOL_VERSION || packet[1] != (uint8_t)OTA_PKT_END)
+    if (packet[0] != (uint8_t)OTA_PKT_END)
         return false;
 
     ota_end_fields_t fields;
-    fields.session_id   = ota_read_u32_le(&packet[2]);
-    fields.image_size   = ota_read_u32_le(&packet[6]);
-    fields.total_chunks = ota_read_u32_le(&packet[10]);
+    fields.session_id   = ota_read_u32_le(&packet[1]);
+    fields.image_size   = ota_read_u32_le(&packet[5]);
+    fields.total_chunks = ota_read_u32_le(&packet[9]);
 
     *fields_out = fields;
     return true;
 }
 
 /* ================= ACK / NACK ================= */
-/* Offset 0:version 1:type 2:session_id(4) 6:acknowledged_type(1)
- * 7:sequence(4) 11:result_code(1) = 12byte */
+/* Offset 0:type 1:session_id(4) 5:acknowledged_type(1)
+ * 6:sequence(4) 10:result_code(1) = 11byte */
 
 static inline size_t ota_protocol_encode_ack(
     uint8_t *packet_out, size_t packet_out_capacity,
@@ -384,12 +409,11 @@ static inline size_t ota_protocol_encode_ack(
     if (packet_out_capacity < OTA_ACK_PACKET_SIZE)
         return 0;
 
-    packet_out[0] = (uint8_t)OTA_PROTOCOL_VERSION;
-    packet_out[1] = (uint8_t)type;
-    ota_write_u32_le(&packet_out[2], fields->session_id);
-    packet_out[6] = fields->acknowledged_type;
-    ota_write_u32_le(&packet_out[7], fields->sequence);
-    packet_out[11] = fields->result_code;
+    packet_out[0] = (uint8_t)type;
+    ota_write_u32_le(&packet_out[1], fields->session_id);
+    packet_out[5] = fields->acknowledged_type;
+    ota_write_u32_le(&packet_out[6], fields->sequence);
+    packet_out[10] = fields->result_code;
 
     return OTA_ACK_PACKET_SIZE;
 }
@@ -400,18 +424,16 @@ static inline bool ota_protocol_decode_ack(
 {
     if (packet == NULL || fields_out == NULL || packet_length != OTA_ACK_PACKET_SIZE)
         return false;
-    if (packet[0] != (uint8_t)OTA_PROTOCOL_VERSION)
-        return false;
-    if (packet[1] != (uint8_t)OTA_PKT_ACK && packet[1] != (uint8_t)OTA_PKT_NACK)
+    if (packet[0] != (uint8_t)OTA_PKT_ACK && packet[0] != (uint8_t)OTA_PKT_NACK)
         return false;
 
     ota_ack_fields_t fields;
-    fields.session_id        = ota_read_u32_le(&packet[2]);
-    fields.acknowledged_type = packet[6];
-    fields.sequence          = ota_read_u32_le(&packet[7]);
-    fields.result_code       = packet[11];
+    fields.session_id        = ota_read_u32_le(&packet[1]);
+    fields.acknowledged_type = packet[5];
+    fields.sequence          = ota_read_u32_le(&packet[6]);
+    fields.result_code       = packet[10];
 
-    if (type_out) *type_out = (ota_packet_type_t)packet[1];
+    if (type_out) *type_out = (ota_packet_type_t)packet[0];
     *fields_out = fields;
     return true;
 }
@@ -427,9 +449,9 @@ static inline bool ota_protocol_decode_ack(
  * 응답 전 짧은 랜덤 지연(백오프)을 두는 것은 ESP32 쪽 구현 책임입니다
  * (이 헤더가 정하는 wire format과 무관 — docs/design-notes 참고).
  *
- * DISCOVER   — Offset 0:version 1:type = 2byte (바디 없음)
- * DISCOVER_ACK — Offset 0:version 1:type 2:device_id(3) 5:fw_major(1)
- *                6:fw_minor(1) 7:fw_patch(1) = 8byte
+ * DISCOVER   — Offset 0:type = 1byte (바디 없음)
+ * DISCOVER_ACK — Offset 0:type 1:device_id(3) 4:fw_major(1)
+ *                5:fw_minor(1) 6:fw_patch(1) = 7byte
  *
  * device_id는 와이어(3byte, 0 ~ OTA_DEVICE_ID_MAX=16,777,215)로만 축소된
  * 것이고(2026-08-11, 원래 4byte였음), ota_discover_ack_fields_t.device_id
@@ -446,8 +468,7 @@ static inline size_t ota_protocol_encode_discover(
     if (packet_out == NULL || packet_out_capacity < OTA_DISCOVER_PACKET_SIZE)
         return 0;
 
-    packet_out[0] = (uint8_t)OTA_PROTOCOL_VERSION;
-    packet_out[1] = (uint8_t)OTA_PKT_DISCOVER;
+    packet_out[0] = (uint8_t)OTA_PKT_DISCOVER;
 
     return OTA_DISCOVER_PACKET_SIZE;
 }
@@ -457,7 +478,7 @@ static inline bool ota_protocol_decode_discover(
 {
     if (packet == NULL || packet_length != OTA_DISCOVER_PACKET_SIZE)
         return false;
-    if (packet[0] != (uint8_t)OTA_PROTOCOL_VERSION || packet[1] != (uint8_t)OTA_PKT_DISCOVER)
+    if (packet[0] != (uint8_t)OTA_PKT_DISCOVER)
         return false;
 
     return true;
@@ -474,12 +495,11 @@ static inline size_t ota_protocol_encode_discover_ack(
     if (fields->device_id > OTA_DEVICE_ID_MAX)
         return 0; /* 3byte(24bit)에 안 들어가는 값 — 조용히 잘리는 대신 거부 */
 
-    packet_out[0] = (uint8_t)OTA_PROTOCOL_VERSION;
-    packet_out[1] = (uint8_t)OTA_PKT_DISCOVER_ACK;
-    ota_write_u24_le(&packet_out[2], fields->device_id);
-    packet_out[5] = fields->fw_major;
-    packet_out[6] = fields->fw_minor;
-    packet_out[7] = fields->fw_patch;
+    packet_out[0] = (uint8_t)OTA_PKT_DISCOVER_ACK;
+    ota_write_u24_le(&packet_out[1], fields->device_id);
+    packet_out[4] = fields->fw_major;
+    packet_out[5] = fields->fw_minor;
+    packet_out[6] = fields->fw_patch;
 
     return OTA_DISCOVER_ACK_PACKET_SIZE;
 }
@@ -490,14 +510,14 @@ static inline bool ota_protocol_decode_discover_ack(
 {
     if (packet == NULL || fields_out == NULL || packet_length != OTA_DISCOVER_ACK_PACKET_SIZE)
         return false;
-    if (packet[0] != (uint8_t)OTA_PROTOCOL_VERSION || packet[1] != (uint8_t)OTA_PKT_DISCOVER_ACK)
+    if (packet[0] != (uint8_t)OTA_PKT_DISCOVER_ACK)
         return false;
 
     ota_discover_ack_fields_t fields;
-    fields.device_id = ota_read_u24_le(&packet[2]);
-    fields.fw_major   = packet[5];
-    fields.fw_minor   = packet[6];
-    fields.fw_patch   = packet[7];
+    fields.device_id = ota_read_u24_le(&packet[1]);
+    fields.fw_major   = packet[4];
+    fields.fw_minor   = packet[5];
+    fields.fw_patch   = packet[6];
 
     *fields_out = fields;
     return true;

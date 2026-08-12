@@ -13,11 +13,11 @@
 static void test_sizes(void)
 {
     assert(OTA_RF_PACKET_BODY_MAX_SIZE == 60);
-    assert(OTA_DATA_HEADER_SIZE == 13);
-    assert(OTA_MAX_PAYLOAD_SIZE == 47);
-    assert(OTA_START_PACKET_SIZE == 50);
-    assert(OTA_END_PACKET_SIZE == 14);
-    assert(OTA_ACK_PACKET_SIZE == 12);
+    assert(OTA_DATA_HEADER_SIZE == 12);
+    assert(OTA_MAX_PAYLOAD_SIZE == 48);
+    assert(OTA_START_PACKET_SIZE == 49);
+    assert(OTA_END_PACKET_SIZE == 13);
+    assert(OTA_ACK_PACKET_SIZE == 11);
     printf("[OK] 패킷 크기: START=%u DATA header=%u(+payload<=%u) END=%u ACK/NACK=%u\n",
            OTA_START_PACKET_SIZE, OTA_DATA_HEADER_SIZE, OTA_MAX_PAYLOAD_SIZE,
            OTA_END_PACKET_SIZE, OTA_ACK_PACKET_SIZE);
@@ -63,10 +63,8 @@ static void test_start_roundtrip(void)
     size_t written = ota_protocol_encode_start(packet, sizeof(packet), &fields);
     assert(written == OTA_START_PACKET_SIZE);
 
-    uint8_t version;
     ota_packet_type_t type;
-    assert(ota_protocol_peek_type(packet, written, &version, &type));
-    assert(version == OTA_PROTOCOL_VERSION);
+    assert(ota_protocol_peek_type(packet, written, &type));
     assert(type == OTA_PKT_START);
 
     ota_start_fields_t decoded;
@@ -202,10 +200,8 @@ static void test_peek_type_dispatches_correctly(void)
     uint8_t packet[OTA_ACK_PACKET_SIZE];
     ota_protocol_encode_ack(packet, sizeof(packet), OTA_PKT_ACK, &fields);
 
-    uint8_t version = 0;
     ota_packet_type_t type;
-    assert(ota_protocol_peek_type(packet, sizeof(packet), &version, &type));
-    assert(version == OTA_PROTOCOL_VERSION);
+    assert(ota_protocol_peek_type(packet, sizeof(packet), &type));
     assert(type == OTA_PKT_ACK);
     printf("[OK] peek_type으로 디코더 분기 가능 확인\n");
 }
@@ -231,11 +227,10 @@ static void test_discover_ack_roundtrip(void)
     uint8_t packet[OTA_DISCOVER_ACK_PACKET_SIZE];
     size_t written = ota_protocol_encode_discover_ack(packet, sizeof(packet), &fields);
     assert(written == OTA_DISCOVER_ACK_PACKET_SIZE);
-    assert(written == 8); /* 2(header) + 3(device_id) + 3(fw) */
+    assert(written == 7); /* 1(type) + 3(device_id) + 3(fw) */
 
-    uint8_t version = 0;
     ota_packet_type_t type;
-    assert(ota_protocol_peek_type(packet, written, &version, &type));
+    assert(ota_protocol_peek_type(packet, written, &type));
     assert(type == OTA_PKT_DISCOVER_ACK);
 
     ota_discover_ack_fields_t decoded;
