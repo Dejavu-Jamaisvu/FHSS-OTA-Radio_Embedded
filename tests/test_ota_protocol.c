@@ -18,6 +18,9 @@ static void test_sizes(void)
     assert(OTA_START_PACKET_SIZE == 49);
     assert(OTA_END_PACKET_SIZE == 13);
     assert(OTA_ACK_PACKET_SIZE == 11);
+    assert(OTA_FHSS_CONFIG_PACKET_SIZE == 33);
+    assert(OTA_FHSS_ACTIVATE_PACKET_SIZE == 13);
+    assert(OTA_FHSS_SYNC_PACKET_SIZE == 13);
     printf("[OK] 패킷 크기: START=%u DATA header=%u(+payload<=%u) END=%u ACK/NACK=%u\n",
            OTA_START_PACKET_SIZE, OTA_DATA_HEADER_SIZE, OTA_MAX_PAYLOAD_SIZE,
            OTA_END_PACKET_SIZE, OTA_ACK_PACKET_SIZE);
@@ -256,6 +259,178 @@ static void test_discover_ack_device_id_too_large_rejected(void)
     printf("[OK] device_id가 24bit를 넘으면 DISCOVER_ACK 인코딩이 거부됨\n");
 }
 
+static ota_fhss_config_fields_t valid_fhss_config(void)
+{
+    ota_fhss_config_fields_t fields = {
+        .session_id = 0x11223344u,
+        .target_device_id = OTA_BROADCAST_DEVICE_ID,
+        .generation = 7u,
+        .algorithm_version = OTA_FHSS_ALGORITHM_VERSION,
+        .channel_profile_id = 1u,
+        .first_channel = 1u,
+        .channel_count = 100u,
+        .rendezvous_channel = 1u,
+        .reserved_channel = 0u,
+        .seed = OTA_FHSS_DEFAULT_SEED,
+        .slot_duration_us = 300000u,
+        .channel_switch_guard_us = 5000u,
+    };
+    return fields;
+}
+
+static void test_fhss_config_roundtrip(void)
+{
+    ota_fhss_config_fields_t fields = valid_fhss_config();
+    ota_fhss_config_fields_t decoded;
+    uint8_t packet[OTA_FHSS_CONFIG_PACKET_SIZE];
+    ota_packet_type_t type;
+
+    memset(&decoded, 0, sizeof(decoded));
+    assert(ota_protocol_encode_fhss_config(packet, sizeof(packet), &fields) ==
+           OTA_FHSS_CONFIG_PACKET_SIZE);
+    assert(ota_protocol_peek_type(packet, sizeof(packet), &type));
+    assert(type == OTA_PKT_FHSS_CONFIG);
+    assert(ota_protocol_decode_fhss_config(packet, sizeof(packet), &decoded));
+    assert(decoded.session_id == fields.session_id);
+    assert(decoded.target_device_id == fields.target_device_id);
+    assert(decoded.generation == fields.generation);
+    assert(decoded.algorithm_version == fields.algorithm_version);
+    assert(decoded.channel_profile_id == fields.channel_profile_id);
+    assert(decoded.first_channel == fields.first_channel);
+    assert(decoded.channel_count == fields.channel_count);
+    assert(decoded.rendezvous_channel == fields.rendezvous_channel);
+    assert(decoded.reserved_channel == fields.reserved_channel);
+    assert(decoded.seed == fields.seed);
+    assert(decoded.slot_duration_us == fields.slot_duration_us);
+    assert(decoded.channel_switch_guard_us ==
+           fields.channel_switch_guard_us);
+
+    /* session_id 0x11223344 is serialized Little Endian. */
+    assert(packet[1] == 0x44 && packet[2] == 0x33 &&
+           packet[3] == 0x22 && packet[4] == 0x11);
+    printf("[OK] FHSS_CONFIG 왕복/바이트 순서 확인\n");
+}
+
+static void test_fhss_config_crc_failure(void)
+{
+    ota_fhss_config_fields_t fields = valid_fhss_config();
+    ota_fhss_config_fields_t before;
+    ota_fhss_config_fields_t decoded;
+    uint8_t packet[OTA_FHSS_CONFIG_PACKET_SIZE];
+
+    assert(ota_protocol_encode_fhss_config(packet, sizeof(packet), &fields) ==
+           OTA_FHSS_CONFIG_PACKET_SIZE);
+    packet[19] ^= 0x80u; /* seed를 깨뜨리되 CRC는 갱신하지 않는다. */
+    memset(&before, 0xA5, sizeof(before));
+    decoded = before;
+    assert(!ota_protocol_decode_fhss_config(packet, sizeof(packet), &decoded));
+    assert(memcmp(&decoded, &before, sizeof(decoded)) == 0);
+    printf("[OK] 손상된 FHSS_CONFIG CRC 거부 및 out 파라미터 보존\n");
+}
+
+static void test_fhss_config_invalid_values(void)
+{
+    ota_fhss_config_fields_t fields = valid_fhss_config();
+    uint8_t packet[OTA_FHSS_CONFIG_PACKET_SIZE];
+
+    fields.channel_count = 0u;
+    assert(ota_protocol_encode_fhss_config(packet, sizeof(packet), &fields) == 0u);
+    fields = valid_fhss_config();
+    fields.first_channel = 250u;
+    fields.channel_count = 10u;
+    assert(ota_protocol_encode_fhss_config(packet, sizeof(packet), &fields) == 0u);
+    fields = valid_fhss_config();
+    fields.rendezvous_channel = 2u;
+    assert(ota_protocol_encode_fhss_config(packet, sizeof(packet), &fields) == 0u);
+    fields = valid_fhss_config();
+    fields.reserved_channel = 50u;
+    assert(ota_protocol_encode_fhss_config(packet, sizeof(packet), &fields) == 0u);
+    fields = valid_fhss_config();
+    fields.channel_switch_guard_us = fields.slot_duration_us;
+    assert(ota_protocol_encode_fhss_config(packet, sizeof(packet), &fields) == 0u);
+    printf("[OK] 잘못된 FHSS_CONFIG 값 거부\n");
+}
+
+static void test_fhss_activate_roundtrip(void)
+{
+    const ota_fhss_activate_fields_t fields = {
+        .session_id = 0x12345678u,
+        .target_device_id = OTA_BROADCAST_DEVICE_ID,
+        .generation = 7u,
+    };
+    ota_fhss_activate_fields_t decoded;
+    uint8_t packet[OTA_FHSS_ACTIVATE_PACKET_SIZE];
+
+    assert(ota_protocol_encode_fhss_activate(packet, sizeof(packet), &fields) ==
+           OTA_FHSS_ACTIVATE_PACKET_SIZE);
+    assert(ota_protocol_decode_fhss_activate(packet, sizeof(packet), &decoded));
+    assert(decoded.session_id == fields.session_id);
+    assert(decoded.target_device_id == fields.target_device_id);
+    assert(decoded.generation == fields.generation);
+    printf("[OK] FHSS_ACTIVATE 왕복 확인\n");
+}
+
+static void test_fhss_sync_roundtrip(void)
+{
+    const ota_fhss_sync_fields_t fields = {
+        .sync_version = OTA_FHSS_SYNC_VERSION,
+        .generation = 7u,
+        .sequence = 0x1234u,
+        .hop_index = 42u,
+        .slot_number = 0x11223344u,
+    };
+    ota_fhss_sync_fields_t decoded;
+    uint8_t packet[OTA_FHSS_SYNC_PACKET_SIZE];
+
+    assert(ota_protocol_encode_fhss_sync(packet, sizeof(packet), &fields) ==
+           OTA_FHSS_SYNC_PACKET_SIZE);
+    assert(ota_protocol_decode_fhss_sync(packet, sizeof(packet), &decoded));
+    assert(decoded.sync_version == fields.sync_version);
+    assert(decoded.generation == fields.generation);
+    assert(decoded.sequence == fields.sequence);
+    assert(decoded.hop_index == fields.hop_index);
+    assert(decoded.slot_number == fields.slot_number);
+    assert(packet[6] == 0x34 && packet[7] == 0x12);
+    assert(packet[9] == 0x44 && packet[10] == 0x33 &&
+           packet[11] == 0x22 && packet[12] == 0x11);
+
+    packet[1] = (uint8_t)(OTA_FHSS_SYNC_VERSION + 1u);
+    assert(!ota_protocol_decode_fhss_sync(packet, sizeof(packet), &decoded));
+    printf("[OK] FHSS_SYNC 왕복/LE/버전 거부 확인\n");
+}
+
+static void test_fhss_sequence_golden_vector(void)
+{
+    static const uint8_t expected_first_20[] = {
+        1, 72, 92, 28, 32, 67, 50, 53, 22, 17,
+        7, 37, 68, 27, 86, 51, 46, 80, 33, 99,
+    };
+    uint8_t sequence[100];
+
+    assert(ota_fhss_build_sequence(sequence, sizeof(sequence), 1u, 100u,
+                                   OTA_FHSS_DEFAULT_SEED));
+    assert(memcmp(sequence, expected_first_20,
+                  sizeof(expected_first_20)) == 0);
+    assert(sequence[0] == 1u); /* rendezvous channel은 셔플하지 않는다. */
+    for (size_t i = 0u; i < sizeof(sequence); ++i) {
+        assert(sequence[i] >= 1u && sequence[i] <= 100u);
+        for (size_t j = 0u; j < i; ++j)
+            assert(sequence[i] != sequence[j]);
+    }
+    printf("[OK] FHSS seed 고정 테스트 벡터와 채널 중복 없음 확인\n");
+}
+
+static void test_fhss_sequence_invalid_range(void)
+{
+    uint8_t sequence[100];
+
+    assert(!ota_fhss_build_sequence(NULL, 100u, 1u, 100u, 1u));
+    assert(!ota_fhss_build_sequence(sequence, 99u, 1u, 100u, 1u));
+    assert(!ota_fhss_build_sequence(sequence, sizeof(sequence), 250u, 10u, 1u));
+    assert(!ota_fhss_build_sequence(sequence, sizeof(sequence), 1u, 0u, 1u));
+    printf("[OK] 잘못된 FHSS 채널 범위 거부\n");
+}
+
 int main(void)
 {
     test_sizes();
@@ -271,6 +446,13 @@ int main(void)
     test_discover_roundtrip();
     test_discover_ack_roundtrip();
     test_discover_ack_device_id_too_large_rejected();
+    test_fhss_config_roundtrip();
+    test_fhss_config_crc_failure();
+    test_fhss_config_invalid_values();
+    test_fhss_activate_roundtrip();
+    test_fhss_sync_roundtrip();
+    test_fhss_sequence_golden_vector();
+    test_fhss_sequence_invalid_range();
     printf("\n모든 테스트 통과\n");
     return 0;
 }

@@ -62,6 +62,15 @@ extern "C" {
 #define OTA_DISCOVER_PACKET_SIZE     1u  /* type 뿐, 바디 없음 */
 #define OTA_DISCOVER_ACK_PACKET_SIZE 7u  /* device_id(3) + fw_major/minor/patch */
 
+/* FHSS control packets (all remain below the 60-byte RF body limit). */
+#define OTA_FHSS_ALGORITHM_VERSION       1u
+#define OTA_FHSS_SYNC_VERSION            1u
+#define OTA_FHSS_DEFAULT_SEED            0x46485353u
+#define OTA_FHSS_ZERO_SEED_FALLBACK      0x6D2B79F5u
+#define OTA_FHSS_CONFIG_PACKET_SIZE      33u
+#define OTA_FHSS_ACTIVATE_PACKET_SIZE    13u
+#define OTA_FHSS_SYNC_PACKET_SIZE        13u
+
 /* `sequence`/`total_chunks`는 plan_A.md 원안대로 32bit 유지(2026-08-11).
  * 한때 65,535개(16bit)면 충분해 보인다고 판단해 축소를 검토했으나, RF
  * 담당 의견으로 "일단 여유 있게 32bit로 두고, 나중에 실제로 좁혀도 되는
@@ -82,6 +91,10 @@ typedef enum {
     OTA_PKT_NACK         = 5,
     OTA_PKT_DISCOVER     = 6,  /* 조회 질의 — 게이트웨이 -> 브로드캐스트("OTA 대기중인 기기 있나?") */
     OTA_PKT_DISCOVER_ACK = 7,  /* 조회 응답 — MENU_OTA 대기중인 ESP32 각자 응답 */
+
+    OTA_PKT_FHSS_CONFIG   = 8,  /* hopping configuration */
+    OTA_PKT_FHSS_ACTIVATE = 9,  /* activate a stored generation */
+    OTA_PKT_FHSS_SYNC     = 10, /* runtime slot synchronization */
 } ota_packet_type_t;
 
 /* ---------- ACK/NACK의 result_code ----------
@@ -152,6 +165,38 @@ typedef struct {
 } ota_discover_ack_fields_t;
 
 /* device_id가 와이어에 담을 수 있는 최댓값 (3byte = 16,777,215) */
+/* FHSS_CONFIG sends the inputs needed to reproduce a hopping order instead
+ * of sending the entire channel array. A receiver stores this as pending
+ * configuration and applies it only after a matching FHSS_ACTIVATE packet. */
+typedef struct {
+    uint32_t session_id;
+    uint32_t target_device_id;
+    uint32_t generation;
+    uint8_t algorithm_version;
+    uint8_t channel_profile_id;
+    uint8_t first_channel;
+    uint8_t channel_count;
+    uint8_t rendezvous_channel;
+    uint8_t reserved_channel;
+    uint32_t seed;
+    uint32_t slot_duration_us;
+    uint32_t channel_switch_guard_us;
+} ota_fhss_config_fields_t;
+
+typedef struct {
+    uint32_t session_id;
+    uint32_t target_device_id;
+    uint32_t generation;
+} ota_fhss_activate_fields_t;
+
+typedef struct {
+    uint8_t sync_version;
+    uint32_t generation;
+    uint16_t sequence;
+    uint8_t hop_index;
+    uint32_t slot_number;
+} ota_fhss_sync_fields_t;
+
 #define OTA_DEVICE_ID_MAX 0xFFFFFFu
 
 /* ---------- Little Endian 바이트 조립/해석 ----------
@@ -520,6 +565,213 @@ static inline bool ota_protocol_decode_discover_ack(
     fields.fw_patch   = packet[6];
 
     *fields_out = fields;
+    return true;
+}
+
+/* ================= FHSS CONFIG / ACTIVATE / SYNC ================= */
+
+static inline bool ota_fhss_config_is_valid(
+    const ota_fhss_config_fields_t *fields)
+{
+    uint16_t last_channel;
+
+    if (fields == NULL ||
+        fields->algorithm_version != OTA_FHSS_ALGORITHM_VERSION ||
+        fields->channel_count == 0u ||
+        fields->slot_duration_us == 0u ||
+        fields->channel_switch_guard_us >= fields->slot_duration_us)
+        return false;
+
+    last_channel = (uint16_t)fields->first_channel +
+                   (uint16_t)fields->channel_count - 1u;
+    if (last_channel > 255u)
+        return false;
+    /* 드라이버와 ESP32 모두 호핑 순서의 첫 채널을 셔플하지 않고
+     * 초기 동기 획득용 랑데부 채널로 사용한다. */
+    if (fields->rendezvous_channel != fields->first_channel)
+        return false;
+    if (fields->reserved_channel >= fields->first_channel &&
+        fields->reserved_channel <= last_channel)
+        return false;
+
+    return true;
+}
+
+/* Offset 0:type, 1:session(4), 5:target(4), 9:generation(4),
+ * 13:algorithm, 14:profile, 15:first channel, 16:count,
+ * 17:rendezvous, 18:reserved, 19:seed(4), 23:slot duration(4),
+ * 27:switch guard(4), 31:CRC16 over bytes 0..30 = 33 bytes. */
+static inline size_t ota_protocol_encode_fhss_config(
+    uint8_t *packet_out, size_t packet_out_capacity,
+    const ota_fhss_config_fields_t *fields)
+{
+    uint16_t crc;
+
+    if (packet_out == NULL || fields == NULL ||
+        packet_out_capacity < OTA_FHSS_CONFIG_PACKET_SIZE ||
+        !ota_fhss_config_is_valid(fields))
+        return 0;
+
+    packet_out[0] = (uint8_t)OTA_PKT_FHSS_CONFIG;
+    ota_write_u32_le(&packet_out[1], fields->session_id);
+    ota_write_u32_le(&packet_out[5], fields->target_device_id);
+    ota_write_u32_le(&packet_out[9], fields->generation);
+    packet_out[13] = fields->algorithm_version;
+    packet_out[14] = fields->channel_profile_id;
+    packet_out[15] = fields->first_channel;
+    packet_out[16] = fields->channel_count;
+    packet_out[17] = fields->rendezvous_channel;
+    packet_out[18] = fields->reserved_channel;
+    ota_write_u32_le(&packet_out[19], fields->seed);
+    ota_write_u32_le(&packet_out[23], fields->slot_duration_us);
+    ota_write_u32_le(&packet_out[27], fields->channel_switch_guard_us);
+    crc = ota_protocol_crc16(packet_out, 31u);
+    ota_write_u16_le(&packet_out[31], crc);
+    return OTA_FHSS_CONFIG_PACKET_SIZE;
+}
+
+static inline bool ota_protocol_decode_fhss_config(
+    const uint8_t *packet, size_t packet_length,
+    ota_fhss_config_fields_t *fields_out)
+{
+    ota_fhss_config_fields_t fields;
+
+    if (packet == NULL || fields_out == NULL ||
+        packet_length != OTA_FHSS_CONFIG_PACKET_SIZE ||
+        packet[0] != (uint8_t)OTA_PKT_FHSS_CONFIG ||
+        ota_read_u16_le(&packet[31]) != ota_protocol_crc16(packet, 31u))
+        return false;
+
+    fields.session_id = ota_read_u32_le(&packet[1]);
+    fields.target_device_id = ota_read_u32_le(&packet[5]);
+    fields.generation = ota_read_u32_le(&packet[9]);
+    fields.algorithm_version = packet[13];
+    fields.channel_profile_id = packet[14];
+    fields.first_channel = packet[15];
+    fields.channel_count = packet[16];
+    fields.rendezvous_channel = packet[17];
+    fields.reserved_channel = packet[18];
+    fields.seed = ota_read_u32_le(&packet[19]);
+    fields.slot_duration_us = ota_read_u32_le(&packet[23]);
+    fields.channel_switch_guard_us = ota_read_u32_le(&packet[27]);
+
+    if (!ota_fhss_config_is_valid(&fields))
+        return false;
+    *fields_out = fields;
+    return true;
+}
+
+/* Offset 0:type, 1:session(4), 5:target(4), 9:generation(4). */
+static inline size_t ota_protocol_encode_fhss_activate(
+    uint8_t *packet_out, size_t packet_out_capacity,
+    const ota_fhss_activate_fields_t *fields)
+{
+    if (packet_out == NULL || fields == NULL ||
+        packet_out_capacity < OTA_FHSS_ACTIVATE_PACKET_SIZE)
+        return 0;
+    packet_out[0] = (uint8_t)OTA_PKT_FHSS_ACTIVATE;
+    ota_write_u32_le(&packet_out[1], fields->session_id);
+    ota_write_u32_le(&packet_out[5], fields->target_device_id);
+    ota_write_u32_le(&packet_out[9], fields->generation);
+    return OTA_FHSS_ACTIVATE_PACKET_SIZE;
+}
+
+static inline bool ota_protocol_decode_fhss_activate(
+    const uint8_t *packet, size_t packet_length,
+    ota_fhss_activate_fields_t *fields_out)
+{
+    ota_fhss_activate_fields_t fields;
+
+    if (packet == NULL || fields_out == NULL ||
+        packet_length != OTA_FHSS_ACTIVATE_PACKET_SIZE ||
+        packet[0] != (uint8_t)OTA_PKT_FHSS_ACTIVATE)
+        return false;
+    fields.session_id = ota_read_u32_le(&packet[1]);
+    fields.target_device_id = ota_read_u32_le(&packet[5]);
+    fields.generation = ota_read_u32_le(&packet[9]);
+    *fields_out = fields;
+    return true;
+}
+
+/* Runtime SYNC is deliberately 13 bytes, matching the current ESP32 packet
+ * budget while using this protocol's Little Endian convention.
+ * Offset 0:type, 1:sync version, 2:generation(4), 6:sequence(2),
+ * 8:hop index, 9:slot number(4). */
+static inline size_t ota_protocol_encode_fhss_sync(
+    uint8_t *packet_out, size_t packet_out_capacity,
+    const ota_fhss_sync_fields_t *fields)
+{
+    if (packet_out == NULL || fields == NULL ||
+        fields->sync_version != OTA_FHSS_SYNC_VERSION ||
+        packet_out_capacity < OTA_FHSS_SYNC_PACKET_SIZE)
+        return 0;
+    packet_out[0] = (uint8_t)OTA_PKT_FHSS_SYNC;
+    packet_out[1] = fields->sync_version;
+    ota_write_u32_le(&packet_out[2], fields->generation);
+    ota_write_u16_le(&packet_out[6], fields->sequence);
+    packet_out[8] = fields->hop_index;
+    ota_write_u32_le(&packet_out[9], fields->slot_number);
+    return OTA_FHSS_SYNC_PACKET_SIZE;
+}
+
+static inline bool ota_protocol_decode_fhss_sync(
+    const uint8_t *packet, size_t packet_length,
+    ota_fhss_sync_fields_t *fields_out)
+{
+    ota_fhss_sync_fields_t fields;
+
+    if (packet == NULL || fields_out == NULL ||
+        packet_length != OTA_FHSS_SYNC_PACKET_SIZE ||
+        packet[0] != (uint8_t)OTA_PKT_FHSS_SYNC ||
+        packet[1] != OTA_FHSS_SYNC_VERSION)
+        return false;
+    fields.sync_version = packet[1];
+    fields.generation = ota_read_u32_le(&packet[2]);
+    fields.sequence = ota_read_u16_le(&packet[6]);
+    fields.hop_index = packet[8];
+    fields.slot_number = ota_read_u32_le(&packet[9]);
+    *fields_out = fields;
+    return true;
+}
+
+static inline uint32_t ota_fhss_xorshift32(uint32_t *state)
+{
+    uint32_t value = *state;
+    value ^= value << 13u;
+    value ^= value >> 17u;
+    value ^= value << 5u;
+    *state = value;
+    return value;
+}
+
+/* Build the same rendezvous-first permutation used by firmware-esp32:
+ * sequence[0] stays fixed and only sequence[1..count-1] is shuffled. */
+static inline bool ota_fhss_build_sequence(
+    uint8_t *sequence_out, size_t sequence_capacity,
+    uint8_t first_channel, uint8_t channel_count, uint32_t seed)
+{
+    uint16_t last_channel;
+    uint32_t state;
+    size_t i;
+
+    if (sequence_out == NULL || channel_count == 0u ||
+        sequence_capacity < channel_count)
+        return false;
+    last_channel = (uint16_t)first_channel + (uint16_t)channel_count - 1u;
+    if (last_channel > 255u)
+        return false;
+
+    for (i = 0u; i < channel_count; ++i)
+        sequence_out[i] = (uint8_t)((uint16_t)first_channel + i);
+
+    state = seed != 0u ? seed : OTA_FHSS_ZERO_SEED_FALLBACK;
+    for (i = channel_count; i > 2u; --i) {
+        size_t selected = 1u +
+            (size_t)(ota_fhss_xorshift32(&state) % (uint32_t)(i - 1u));
+        uint8_t temporary = sequence_out[i - 1u];
+        sequence_out[i - 1u] = sequence_out[selected];
+        sequence_out[selected] = temporary;
+    }
     return true;
 }
 
