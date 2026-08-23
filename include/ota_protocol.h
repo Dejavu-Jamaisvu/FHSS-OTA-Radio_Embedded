@@ -193,6 +193,8 @@ typedef struct {
     uint8_t sync_version;
     uint32_t generation;
     uint16_t sequence;
+    /* 셔플된 순서가 선택한 실제 채널의 0-based 인덱스.
+     * 연속 채널 프로필에서는 channel - first_channel과 같다. */
     uint8_t hop_index;
     uint32_t slot_number;
 } ota_fhss_sync_fields_t;

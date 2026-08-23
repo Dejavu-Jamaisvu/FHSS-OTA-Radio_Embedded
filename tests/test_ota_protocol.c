@@ -412,6 +412,9 @@ static void test_fhss_sequence_golden_vector(void)
     assert(memcmp(sequence, expected_first_20,
                   sizeof(expected_first_20)) == 0);
     assert(sequence[0] == 1u); /* rendezvous channel은 셔플하지 않는다. */
+    /* slot 1의 실제 채널은 72이므로 wire hop_index는 단순 slot 번호 1이
+     * 아니라 0-based 채널 인덱스 71이다. 커널/ESP32 의미 불일치 회귀 방지. */
+    assert((uint8_t)(sequence[1] - 1u) == 71u);
     for (size_t i = 0u; i < sizeof(sequence); ++i) {
         assert(sequence[i] >= 1u && sequence[i] <= 100u);
         for (size_t j = 0u; j < i; ++j)
