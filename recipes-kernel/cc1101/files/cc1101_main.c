@@ -25,8 +25,10 @@
 #include <linux/kfifo.h>
 #include <linux/string.h>
 #include <linux/err.h>
+#include <linux/version.h>
 
 #include "cc1101.h"
+#include "cc1101_fhss.h"
 #include "cc1101_ioctl.h"
 
 static int cc1101_handle_rx_packet(struct cc1101 *cc)
@@ -49,8 +51,14 @@ static int cc1101_handle_rx_packet(struct cc1101 *cc)
 		goto out_unlock;
 	}
 
-	if ((rxbytes & CC1101_RXBYTES_MASK) < 1)
+	if ((rxbytes & CC1101_RXBYTES_MASK) < 1) {
+		/* [2026-08-16 임시 디버그] GDO2 인터럽트는 울렸는데(카운트 증가),
+		 * 정작 SPI로 RXBYTES를 읽어보니 0인 경우 — 인터럽트 발생 시점과
+		 * 실제 SPI 읽기 시점 사이의 타이밍/레이스 의심 지점. */
+		dev_warn(&cc->spi->dev,
+			 "[임시디버그] GDO2 울렸는데 RXBYTES=0x%02x (빈 FIFO)\n", rxbytes);
 		goto out_rearm;
+	}
 
 	ret = cc1101_read_burst(cc, CC1101_RXFIFO, &len, 1);
 	if (ret)
@@ -73,17 +81,75 @@ static int cc1101_handle_rx_packet(struct cc1101 *cc)
 	if (ret)
 		goto out_unlock;
 
+	/* [2026-08-16 임시 디버그] dynamic_debug가 이 커널엔 안 켜져 있어서
+	 * dev_dbg는 dmesg에 절대 안 보임 -> 원인 파악을 위해 잠깐 dev_warn으로
+	 * 올려서 항상 보이게 함. 원인 확인되면 dev_dbg로 되돌릴 것. */
 	if (!(status[1] & CC1101_LQI_CRC_OK)) {
-		dev_dbg(&cc->spi->dev, "CRC 오류, 패킷 폐기 (len=%u)\n", len);
+		dev_warn(&cc->spi->dev,
+			 "[임시디버그] CRC 오류, 패킷 폐기 (len=%u, rssi_raw=0x%02x, status=0x%02x)\n",
+			 len, status[0], status[1]);
 		goto out_rearm;
+	}
+
+	/* SLAVE가 동작 중이면 SYNC 제어 패킷은 사용자 앱으로 올리지 않고
+	 * 드라이버가 직접 처리한다. 그래야 앱은 평소처럼 read/write만 하면 된다.
+	 * config_lock은 cc->lock보다 먼저 잡는 규칙이므로 여기서 두 락을 겹쳐
+	 * 잡지 않고, 라디오를 재무장하고 cc->lock을 푼 다음 처리한다. */
+	if (cc1101_fhss_is_sync_packet(cc, payload, len)) {
+		u64 rx_time_ns = ktime_get_ns();
+
+		if (cc->state != CC1101_STATE_TX)
+			cc1101_enter_rx_recover(cc);
+		mutex_unlock(&cc->lock);
+		cc1101_fhss_handle_sync(cc, payload, len, rx_time_ns);
+		return 0;
+	}
+
+	/* [버그 수정 2026-08-16] 큐가 가득 차면 "새 패킷"이 아니라 "오래된
+	 * 패킷"부터 버린다.
+	 *
+	 * 이전 코드는 자리가 없으면 방금 받은 패킷을 그냥 버렸다. 그러면 한 번
+	 * 큐가 차는 순간부터 영원히 새 패킷이 못 들어와서, 유저 프로그램이
+	 * 큐를 다 비워주기 전까지 수신이 완전히 마비된다(실기기에서 실제로
+	 * 이 상태에 빠짐 — 같은 대역을 쓰는 다른 팀 패킷이 큐를 채워버렸고,
+	 * 그 뒤로 우리 OTA 패킷이 하나도 안 올라옴).
+	 *
+	 * 통신에서는 "오래된 데이터"가 "새 데이터"보다 가치가 낮다. 어차피
+	 * 놓칠 거라면 지나간 것을 버리는 쪽이 맞다.
+	 */
+	while (kfifo_avail(&cc->rx_fifo) < (unsigned int)(len + 1)) {
+		u8 drop_len;
+		u8 scratch[CC1101_MAX_PACKET_LEN];
+
+		if (kfifo_out(&cc->rx_fifo, &drop_len, 1) != 1)
+			break;			/* 큐가 비었는데도 자리가 없으면 포기 */
+		if (drop_len > CC1101_MAX_PACKET_LEN) {
+			/* 큐 내용이 깨졌다는 뜻 — 통째로 비우고 새로 시작 */
+			kfifo_reset(&cc->rx_fifo);
+			dev_warn(&cc->spi->dev,
+				 "RX 큐 내용 손상(len=%u), 큐 초기화\n", drop_len);
+			break;
+		}
+		if (kfifo_out(&cc->rx_fifo, scratch, drop_len) != drop_len) {
+			/* 길이바이트는 있었는데 본문이 모자람 = 큐 내용 깨짐 */
+			kfifo_reset(&cc->rx_fifo);
+			dev_warn(&cc->spi->dev, "RX 큐 내용 불일치, 큐 초기화\n");
+			break;
+		}
+		dev_warn_ratelimited(&cc->spi->dev,
+				      "RX 큐 가득 참 — 오래된 패킷 1개 버림\n");
 	}
 
 	if (kfifo_avail(&cc->rx_fifo) >= (unsigned int)(len + 1)) {
 		kfifo_in(&cc->rx_fifo, &len, 1);
 		kfifo_in(&cc->rx_fifo, payload, len);
 		wake_up_interruptible(&cc->rx_wait);
+		dev_warn(&cc->spi->dev,
+			 "[임시디버그] 패킷 큐에 넣음 (len=%u, rssi_raw=0x%02x, first_byte=0x%02x)\n",
+			 len, status[0], payload[0]);
 	} else {
-		dev_warn(&cc->spi->dev, "RX 소프트웨어 큐 가득 참, 패킷 폐기\n");
+		dev_warn_ratelimited(&cc->spi->dev,
+				      "RX 큐 확보 실패, 패킷 폐기 (len=%u)\n", len);
 	}
 
 out_rearm:
@@ -99,8 +165,9 @@ static irqreturn_t cc1101_gdo2_thread(int irq, void *data)
 {
 	struct cc1101 *cc = data;
 
-	if (gpiod_get_value(cc->gdo2))
-		cc1101_handle_rx_packet(cc);
+	/* rising-edge IRQ 자체가 이벤트이므로 스레드 실행 시점의 레벨을
+	 * 다시 읽지 않는다. 짧은 펄스라면 그 사이 low로 바뀔 수 있다. */
+	cc1101_handle_rx_packet(cc);
 
 	return IRQ_HANDLED;
 }
@@ -108,26 +175,47 @@ static irqreturn_t cc1101_gdo2_thread(int irq, void *data)
 static irqreturn_t cc1101_gdo0_thread(int irq, void *data)
 {
 	struct cc1101 *cc = data;
-	bool level = gpiod_get_value(cc->gdo0);
 
 	mutex_lock(&cc->lock);
 	if (cc->state == CC1101_STATE_TX) {
-		if (!level) {
-			/* falling edge: 송신 완료 */
-			cc->state = CC1101_STATE_RX;
-			cc1101_enter_rx(cc);
-			mutex_unlock(&cc->lock);
-			complete(&cc->tx_done);
-			return IRQ_HANDLED;
-		}
+		/* GDO0은 falling edge만 등록한다. IOCFG0=0x06에서 이 에지는
+		 * 송신 또는 수신 패킷의 끝을 의미한다.
+		 *
+		 * 송신 완료 -> 명시적으로 RX 재진입
+			 *
+			 * [되돌림 2026-08-16] 한때 여기서 cc1101_enter_rx() 호출을
+			 * 제거했다가 되돌렸다. 경위를 남긴다.
+			 *
+			 * 제거했던 이유(가설): GDO0(IOCFG0=0x06)의 falling edge는
+			 * "패킷 끝"이지만 마지막 몇 바이트가 아직 안테나로 나가는
+			 * 중일 수 있어, 그 순간 SRX를 강제하면 칩이 애매한 상태에
+			 * 빠질 수 있다. MCSM1=0x3F(TXOFF_MODE=11)가 이미 "송신 끝나면
+			 * 자동 RX 복귀"이므로 수동 SRX는 불필요하다고 판단했다.
+			 * gateway-ota의 SpidevTransport에서 유사한 증상을 같은 방식으로
+			 * 고친 전례도 있었다(design-notes-gateway-ota-es.md 17절).
+			 *
+			 * 되돌린 이유(실측): 이 변경을 올린 뒤 송신측 pi24의
+			 * /proc/interrupts에서 cc1101-gdo0 카운트가 7,700만 회를
+			 * 넘겼다 — 인터럽트 폭주(IRQ storm). 폭주는 송신을 수행한
+			 * 쪽에서만 발생했고 수신 전용이던 pi06은 정상(gdo0=6)이었다.
+			 * 즉 SRX를 생략하면 송신 후 칩이 안정된 RX 상태로 수습되지
+			 * 않고 GDO0이 계속 토글하는 상태에 남는다.
+			 *
+			 * 결론: MCSM1의 자동 복귀만 믿으면 안 되고, 명시적 SRX로
+			 * 상태를 확정시켜야 한다. 원래 코드가 맞았다.
+		 */
+		cc->tx_result = cc1101_enter_rx_recover(cc);
 		mutex_unlock(&cc->lock);
+		complete(&cc->tx_done);
 		return IRQ_HANDLED;
 	}
 	mutex_unlock(&cc->lock);
 
-	/* GDO2가 없는 보드에서는 GDO0의 falling edge를 RX 완료로도 사용 */
-	if (!cc->gdo2 && !level)
-		cc1101_handle_rx_packet(cc);
+	/* RX 완료는 GDO0(IOCFG0=0x06)의 falling edge를 사용한다. 일부 보드에서
+	 * DT에 GDO2가 선언되어도 실제 GDO2 IRQ가 발생하지 않아 RX FIFO가 영원히
+	 * drain되지 않았다. TX 상태는 위에서 처리하고 return하므로 여기서는 RX
+	 * 패킷 종료만 처리한다. */
+	cc1101_handle_rx_packet(cc);
 
 	return IRQ_HANDLED;
 }
@@ -143,6 +231,22 @@ static int cc1101_open(struct inode *inode, struct file *filp)
 
 	if (atomic_cmpxchg(&cc->open_count, 0, 1) != 0)
 		return -EBUSY;
+
+	/* [버그 수정 2026-08-16] 열 때 RX 큐를 비운다.
+	 *
+	 * 드라이버는 probe()에서 RX에 들어간 순간부터 계속 수신해서 kfifo에
+	 * 쌓는다. 그런데 그걸 꺼내가는 유저 프로그램은 한참 뒤에야 붙는다.
+	 * 그 사이에 쌓인 데이터는 이미 지나간 남의 패킷이라 쓸모가 없는데,
+	 * 큐를 차지한 채로 남아서 정작 필요한 패킷이 들어올 자리를 막는다.
+	 *
+	 * 실기기 확인(2026-08-16): 같은 433.92MHz/같은 싱크워드를 쓰는 다른
+	 * 팀 장비들의 패킷("FHSS"=0x46485353 로 시작하는 것 등)이 계속 잡혀서
+	 * kfifo(512byte)가 가득 찬 상태로 유지됐고, 그 결과 우리 OTA 패킷은
+	 * 도착해도 전부 "RX 소프트웨어 큐 가득 참"으로 폐기됐다.
+	 */
+	mutex_lock(&cc->lock);
+	kfifo_reset(&cc->rx_fifo);
+	mutex_unlock(&cc->lock);
 
 	filp->private_data = cc;
 	return 0;
@@ -187,21 +291,22 @@ static ssize_t cc1101_read(struct file *filp, char __user *buf, size_t count,
 	return len;
 }
 
-static ssize_t cc1101_write(struct file *filp, const char __user *buf,
-			     size_t count, loff_t *ppos)
+/* 사용자 데이터와 드라이버가 만드는 FHSS SYNC가 같은 안전한 TX 경로를 쓴다.
+ * 이 함수는 TX 완료 GDO0까지 기다리므로 호출이 끝나면 다시 RX 상태이다. */
+int cc1101_transmit_packet(struct cc1101 *cc, const u8 *payload, size_t len)
 {
-	struct cc1101 *cc = filp->private_data;
-	u8 kbuf[CC1101_MAX_PACKET_LEN];
 	u8 txbuf[CC1101_MAX_PACKET_LEN + 1];
 	long timeout;
 	int ret;
 
-	if (count == 0)
+	/* write(fd, ..., 0)은 정상적인 빈 쓰기지만, 데이터가 있는데 주소가
+	 * NULL인 경우는 드라이버 내부 호출 오류이므로 구분해서 반환한다. */
+	if (len == 0)
 		return 0;
-	if (count > CC1101_MAX_PACKET_LEN)
+	if (!payload)
+		return -EINVAL;
+	if (len > CC1101_MAX_PACKET_LEN)
 		return -EMSGSIZE;
-	if (copy_from_user(kbuf, buf, count))
-		return -EFAULT;
 
 	ret = mutex_lock_interruptible(&cc->lock);
 	if (ret)
@@ -213,21 +318,33 @@ static ssize_t cc1101_write(struct file *filp, const char __user *buf,
 	}
 
 	reinit_completion(&cc->tx_done);
+	cc->tx_result = 0;
 
-	cc1101_enter_idle(cc);
-	cc1101_strobe(cc, CC1101_SFTX);	/* 이전 잔여 데이터 flush (IDLE 상태 필수) */
-
-	txbuf[0] = (u8)count;
-	memcpy(&txbuf[1], kbuf, count);
-	ret = cc1101_write_burst(cc, CC1101_TXFIFO, txbuf, count + 1);
+	ret = cc1101_enter_idle(cc);
+	if (!ret)
+		ret = cc1101_strobe(cc, CC1101_SFTX);
 	if (ret) {
-		cc1101_enter_rx(cc);
+		cc1101_enter_rx_recover(cc);
+		mutex_unlock(&cc->lock);
+		return ret;
+	}
+
+	txbuf[0] = (u8)len;
+	memcpy(&txbuf[1], payload, len);
+	ret = cc1101_write_burst(cc, CC1101_TXFIFO, txbuf, len + 1);
+	if (ret) {
+		cc1101_enter_rx_recover(cc);
 		mutex_unlock(&cc->lock);
 		return ret;
 	}
 
 	cc->state = CC1101_STATE_TX;
 	ret = cc1101_strobe(cc, CC1101_STX);
+	if (ret) {
+		cc1101_enter_idle(cc);
+		cc1101_strobe(cc, CC1101_SFTX);
+		cc1101_enter_rx_recover(cc);
+	}
 	mutex_unlock(&cc->lock);
 	if (ret)
 		return ret;
@@ -238,13 +355,44 @@ static ssize_t cc1101_write(struct file *filp, const char __user *buf,
 		dev_warn(&cc->spi->dev, "TX 타임아웃\n");
 		mutex_lock(&cc->lock);
 		cc1101_enter_idle(cc);
-		cc1101_strobe(cc, CC1101_SFTX);
-		cc1101_enter_rx(cc);
+		cc1101_strobe(cc, CC1101_SFTX);//TX FIFO 비우기.
+		/* TX 실패 뒤 RX FIFO도 비정상 상태일 수 있으므로 단순 SRX가
+		 * 아니라 IDLE -> SFRX -> SRX 복구 순서를 사용한다. */
+		cc1101_enter_rx_recover(cc);
 		mutex_unlock(&cc->lock);
 		return -ETIMEDOUT;
 	}
 
-	return count;
+	mutex_lock(&cc->lock);
+	ret = cc->tx_result;
+	if (ret) {
+		cc1101_enter_idle(cc);
+		cc1101_strobe(cc, CC1101_SFTX);
+		cc1101_enter_rx_recover(cc);
+	}
+	mutex_unlock(&cc->lock);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static ssize_t cc1101_write(struct file *filp, const char __user *buf,
+			     size_t count, loff_t *ppos)
+{
+	struct cc1101 *cc = filp->private_data;
+	u8 kbuf[CC1101_MAX_PACKET_LEN];
+	int ret;
+
+	if (count == 0)
+		return 0;
+	if (count > CC1101_MAX_PACKET_LEN)
+		return -EMSGSIZE;
+	if (copy_from_user(kbuf, buf, count))
+		return -EFAULT;
+
+	ret = cc1101_transmit_packet(cc, kbuf, count);
+	return ret ? ret : count;
 }
 
 static __poll_t cc1101_poll(struct file *filp, poll_table *wait)
@@ -399,7 +547,7 @@ static long cc1101_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 	case CC1101_IOC_SET_RX:
 		mutex_lock(&cc->lock);
-		ret = cc1101_enter_rx(cc);
+		ret = cc1101_enter_rx_recover(cc);
 		mutex_unlock(&cc->lock);
 		break;
 	case CC1101_IOC_SET_IDLE:
@@ -426,6 +574,35 @@ static long cc1101_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			ret = cc1101_enter_rx(cc);
 		mutex_unlock(&cc->lock);
 		break;
+	case CC1101_IOC_FHSS_SET_CONFIG: {
+		struct cc1101_fhss_config config;
+
+		if (copy_from_user(&config, argp, sizeof(config)))
+			return -EFAULT;
+		ret = cc1101_fhss_set_config(cc, &config);
+		break;
+	}
+	case CC1101_IOC_FHSS_START: {
+		u8 role;
+
+		if (copy_from_user(&role, argp, sizeof(role)))
+			return -EFAULT;
+		ret = cc1101_fhss_start(cc, role);
+		break;
+	}
+
+	case CC1101_IOC_FHSS_STOP:
+		ret = cc1101_fhss_stop(cc);
+		break;
+
+	case CC1101_IOC_FHSS_GET_STATUS: {
+		struct cc1101_fhss_status status;
+
+		cc1101_fhss_get_status(cc, &status);
+		if (copy_to_user(argp, &status, sizeof(status)))
+			return -EFAULT;
+		break;
+	}
 	default:
 		return -ENOTTY;
 	}
@@ -509,8 +686,7 @@ static int cc1101_probe(struct spi_device *spi)
 
 	ret = devm_request_threaded_irq(dev, cc->irq_gdo0, NULL,
 					 cc1101_gdo0_thread,
-					 IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING |
-					 IRQF_ONESHOT,
+					 IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
 					 "cc1101-gdo0", cc);
 	if (ret) {
 		dev_err(dev, "gdo0 IRQ 요청 실패: %d\n", ret);
@@ -550,6 +726,7 @@ static int cc1101_probe(struct spi_device *spi)
 		dev_err(dev, "misc_register 실패: %d\n", ret);
 		goto err_free_fifo;
 	}
+	spi_set_drvdata(spi, cc);
 
 	mutex_lock(&cc->lock);
 	ret = cc1101_enter_rx(cc);
@@ -559,30 +736,47 @@ static int cc1101_probe(struct spi_device *spi)
 		goto err_free_fifo;
 	}
 
-	spi_set_drvdata(spi, cc);
+	ret = cc1101_fhss_init(cc);
+	if (ret)
+		goto err_deregister_misc;
+
 	dev_info(dev, "/dev/%s 등록 완료\n", cc->miscdev_name);
 	return 0;
 
+err_deregister_misc:
+	misc_deregister(&cc->miscdev);
 err_free_fifo:
 	kfifo_free(&cc->rx_fifo);
 	return ret;
 }
 
-/* spi_driver.remove가 void를 반환하는 최신 API (커널 6.5+) 기준. 이전 커널이면
- * `int cc1101_remove(...)` 로 바꾸고 마지막에 `return 0;`을 추가해야 한다.
+/*
+ * 라즈베리파이에 올라가는 Linux 5.15.92는 remove 함수가 int를 반환해야 한다.
+ * Linux 6.1부터는 void로 바뀌었기 때문에 버전에 맞는 함수 모양을 선택한다.
+ * 이 조건을 없애면 한쪽 커널에서 모듈 빌드가 실패한다.
  */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+static void cc1101_remove(struct spi_device *spi)
+#else
 static int cc1101_remove(struct spi_device *spi)
+#endif
 {
 	struct cc1101 *cc = spi_get_drvdata(spi);
+
+	cc1101_fhss_destroy(cc);
+	misc_deregister(&cc->miscdev);
 
 	mutex_lock(&cc->lock);
 	cc1101_enter_idle(cc);
 	cc1101_strobe(cc, CC1101_SPWD);
 	mutex_unlock(&cc->lock);
 
-	misc_deregister(&cc->miscdev);
 	kfifo_free(&cc->rx_fifo);
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
+	/* Linux 5.15.92의 spi_driver.remove 계약에 필요한 성공 반환값이다. */
 	return 0;
+#endif
 }
 
 static const struct of_device_id cc1101_of_match[] = {

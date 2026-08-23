@@ -110,6 +110,8 @@
 
 #define CC1101_RXBYTES_OVERFLOW	BIT(7)
 #define CC1101_RXBYTES_MASK	0x7F
+#define CC1101_MARCSTATE_MASK	0x1F
+#define CC1101_MARCSTATE_RXFIFO_OVERFLOW	0x11
 #define CC1101_LQI_CRC_OK	BIT(7)
 #define CC1101_LQI_MASK	0x7F
 
@@ -133,6 +135,11 @@ enum cc1101_state {
 /* read()가 반환하는 한 개의 수신 패킷을 rx_fifo에 넣을 때 쓰는 프레이밍: [len][payload...] */
 #define CC1101_RX_FIFO_SIZE	4096
 
+struct cc1101;
+struct cc1101_fhss;
+int cc1101_switch_channel(struct cc1101 *cc, u8 channel);
+int cc1101_transmit_packet(struct cc1101 *cc, const u8 *payload, size_t len);
+
 struct cc1101 {
 	struct spi_device	*spi;
 	struct miscdevice	miscdev;
@@ -147,10 +154,12 @@ struct cc1101 {
 	int			irq_gdo2;
 
 	struct completion	tx_done;
+	int			tx_result;
 	wait_queue_head_t	rx_wait;
 	struct kfifo		rx_fifo;
 
 	atomic_t		open_count;
+	struct cc1101_fhss	*fhss;
 };
 
 /* cc1101_core.c 에서 제공 */
@@ -164,8 +173,10 @@ int cc1101_strobe(struct cc1101 *cc, u8 strobe);
 int cc1101_hw_reset(struct cc1101 *cc);
 int cc1101_load_default_config(struct cc1101 *cc);
 int cc1101_enter_rx(struct cc1101 *cc);
+int cc1101_enter_rx_recover(struct cc1101 *cc);
 int cc1101_enter_idle(struct cc1101 *cc);
 int cc1101_set_freq_hz(struct cc1101 *cc, u32 freq_hz);
+int cc1101_set_channel_spacing_hz(struct cc1101 *cc, u32 spacing_hz);
 int cc1101_set_addr_filter(struct cc1101 *cc, u8 mode);
 int cc1101_read_rssi_dbm(struct cc1101 *cc, s8 *dbm);
 

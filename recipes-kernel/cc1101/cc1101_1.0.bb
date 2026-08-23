@@ -7,6 +7,10 @@ SRC_URI = " \
     file://Makefile \
     file://cc1101_core.c \
     file://cc1101_main.c \
+    file://cc1101_fhss.c \
+    file://cc1101_fhss.h \
+    file://cc1101_hop.c \
+    file://cc1101_hop.h \
     file://cc1101.h \
     file://cc1101_ioctl.h \
 "

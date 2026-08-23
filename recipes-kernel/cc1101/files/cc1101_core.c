@@ -108,6 +108,34 @@ int cc1101_hw_reset(struct cc1101 *cc)
 	return 0;
 }
 
+int cc1101_switch_channel(struct cc1101 *cc, u8 channel)
+{
+	enum cc1101_state previous = cc->state;
+	int ret;
+
+	ret = cc1101_enter_idle(cc);
+	if (ret)
+		return ret;
+
+	ret = cc1101_write_reg(cc, CC1101_CHANNR, channel);
+	if (ret)
+		goto restore;
+
+	ret = cc1101_strobe(cc, CC1101_SFRX);
+	if (ret)
+		goto restore;
+
+restore:
+	if (previous == CC1101_STATE_RX) {
+		int rx_ret = cc1101_enter_rx(cc);
+
+		if (!ret)
+			ret = rx_ret;
+	}
+
+	return ret;
+}
+
 /*
  * 433.92MHz / 2-FSK / 38.4kbps 기준 참고 레지스터 값 (TI SmartRF Studio에서
  * 흔히 쓰이는 표준 설정과 동일한 계산식/상수를 사용). 실제 RF 환경에 맞춰
@@ -115,20 +143,46 @@ int cc1101_hw_reset(struct cc1101 *cc)
  *
  * IOCFG0 = 0x06 : 동기워드 송/수신 시 assert, 패킷 끝에서 deassert
  *                 -> TX 완료 및 (GDO2 미배선 시) RX 완료 알림에 공용으로 사용
- * IOCFG2 = 0x07 : CRC OK 패킷 수신 시 assert, FIFO 첫 바이트 읽으면 deassert
+ * IOCFG2 = 0x29 : high impedance; RX completion uses GDO0 falling edge
  *                 -> GDO2가 배선된 경우 RX 완료 전용 알림으로 사용
  */
 static const u8 cc1101_default_regs[CC1101_NUM_CONFIG_REGS] = {
-	[CC1101_IOCFG2]   = 0x07,
+	[CC1101_IOCFG2]   = 0x29,
 	[CC1101_IOCFG1]   = 0x2E,	/* 미사용: 3-state */
 	[CC1101_IOCFG0]   = 0x06,
 	[CC1101_FIFOTHR]  = 0x47,
+	/* ESP32 rf_transport와 같은 0xD391 물리계층 싱크워드를 사용한다.
+	 * 여기서 말하는 CC1101 싱크워드는 패킷 앞의 하드웨어 검출 값이고,
+	 * FHSS_SYNC 제어 패킷(type=10)과는 다른 개념이다. 한쪽 값만 바꾸면
+	 * 하드웨어 단계에서 서로의 패킷을 전혀 받지 못한다. */
 	[CC1101_SYNC1]    = 0xD3,
 	[CC1101_SYNC0]    = 0x91,
 	[CC1101_PKTLEN]   = CC1101_MAX_PACKET_LEN,	/* 하드웨어 FIFO(64B) 한도에 맞춘 상한 */
-	[CC1101_PKTCTRL1] = 0x0D,	/* APPEND_STATUS=1, CRC_AUTOFLUSH=1, ADR_CHK=주소일치 */
+	/* [2026-08-16] ADR_CHK를 "주소일치"로 켜두면, ota_protocol.h 패킷은
+	 * 페이로드 첫 바이트가 CC1101 주소필터용 주소 바이트가 아니라서 하드웨어가
+	 * CRC 검사도 하기 전에 죄다 버림 (GDO2 "CRC OK 수신" 인터럽트가 한 번도
+	 * 안 울리는 것으로 실기기 확인). SpidevTransport 임시 우회 코드에서도
+	 * 이미 같은 이유로 꺼뒀던 것과 동일 — 주소필터 자체를 꺼서 모든 패킷을
+	 * 받도록 함. */
+	[CC1101_PKTCTRL1] = 0x04,	/* APPEND_STATUS=1, CRC_AUTOFLUSH=0, ADR_CHK=끔(필터 없음) */
 	[CC1101_PKTCTRL0] = 0x05,	/* 가변 길이 패킷, CRC enable */
 	[CC1101_ADDR]     = 0x00,
+	/* 채널 0 = 기준 주파수 그대로(433.92MHz).
+	 *
+	 * [검토했다가 안 쓴 것, 2026-08-16] 다른 팀과의 물리적 분리를 위해
+	 * 채널 이동을 검토했으나, 싱크워드 분리(위 SYNC1/SYNC0)로 충분하다고
+	 * 판단해 0을 유지한다.
+	 *
+	 * 나중에 채널을 옮길 일이 있으면 아래 제약을 반드시 확인할 것:
+	 *   주파수 = 433.92MHz + CHANNR x 채널간격
+	 *   채널간격 = (26MHz/2^18) x (256 + CHANSPC_M) x 2^CHANSPC_E ~= 200kHz
+	 *              (CHANSPC_E = MDMCFG1[1:0] = 2, CHANSPC_M = MDMCFG0 = 0xF8)
+	 *
+	 * 국내 433MHz ISM 밴드가 433.05~434.79MHz이므로 **채널 4(434.72MHz)가
+	 * 상한**이다. 채널 5는 밴드를 벗어나 전파법 위반이고, 큰 값(예: 200)은
+	 * 473.92MHz로 CC1101 지원 밴드(387~464MHz)조차 벗어나 PLL이 락을 못 걸어
+	 * 송수신이 통째로 죽는다. 채널 번호를 함부로 올리면 안 된다.
+	 */
 	[CC1101_CHANNR]   = 0x00,
 	[CC1101_FSCTRL1]  = 0x06,
 	[CC1101_FSCTRL0]  = 0x00,
@@ -137,7 +191,7 @@ static const u8 cc1101_default_regs[CC1101_NUM_CONFIG_REGS] = {
 	[CC1101_FREQ0]    = 0x71,
 	[CC1101_MDMCFG4]  = 0xCA,
 	[CC1101_MDMCFG3]  = 0x83,
-	[CC1101_MDMCFG2]  = 0x13,	/* 2-FSK, 16/16 sync word */
+	[CC1101_MDMCFG2]  = 0x03,	/* 2-FSK, 30/32 sync word; ESP OTA parity */
 	[CC1101_MDMCFG1]  = 0x22,
 	[CC1101_MDMCFG0]  = 0xF8,
 	[CC1101_DEVIATN]  = 0x35,
@@ -198,6 +252,31 @@ int cc1101_enter_rx(struct cc1101 *cc)
 	return ret;
 }
 
+/* RXFIFO_OVERFLOW에서는 SRX만으로 복구되지 않으므로 IDLE에서 FIFO를 비운다. */
+int cc1101_enter_rx_recover(struct cc1101 *cc)
+{
+	u8 marc_state;
+	int ret;
+
+	ret = cc1101_read_status_reg(cc, CC1101_MARCSTATE, &marc_state);
+	if (ret)
+		return ret;
+
+	if ((marc_state & CC1101_MARCSTATE_MASK) ==
+	    CC1101_MARCSTATE_RXFIFO_OVERFLOW) {
+		dev_warn(&cc->spi->dev,
+			 "RX FIFO overflow 상태 감지, FIFO 복구\n");
+		ret = cc1101_enter_idle(cc);
+		if (ret)
+			return ret;
+		ret = cc1101_strobe(cc, CC1101_SFRX);
+		if (ret)
+			return ret;
+	}
+
+	return cc1101_enter_rx(cc);
+}
+
 int cc1101_enter_idle(struct cc1101 *cc)
 {
 	int ret = cc1101_strobe(cc, CC1101_SIDLE);
@@ -236,6 +315,43 @@ int cc1101_set_freq_hz(struct cc1101 *cc, u32 freq_hz)
 		ret = cc1101_enter_rx(cc);
 
 	return ret;
+}
+
+/* CHANSPC = f_xosc / 2^18 * (256 + M) * 2^E, datasheet 13.5 */
+int cc1101_set_channel_spacing_hz(struct cc1101 *cc, u32 spacing_hz)
+{
+	u64 best_diff = ~0ULL;
+	u8 best_e = 0, best_m = 0;
+	u8 mdmcfg1;
+	int e, m, ret;
+
+	if (!spacing_hz)
+		return -EINVAL;
+
+	for (e = 0; e <= 3; e++) {
+		for (m = 0; m <= 255; m++) {
+			u64 actual = div_u64((u64)CC1101_XOSC_HZ *
+					     (256 + m) * (1U << e), 1U << 18);
+			u64 diff = actual > spacing_hz ?
+				actual - spacing_hz : spacing_hz - actual;
+
+			if (diff < best_diff) {
+				best_diff = diff;
+				best_e = e;
+				best_m = m;
+			}
+		}
+	}
+
+	ret = cc1101_read_reg(cc, CC1101_MDMCFG1, &mdmcfg1);
+	if (ret)
+		return ret;
+	mdmcfg1 = (mdmcfg1 & ~0x03) | best_e;
+
+	ret = cc1101_write_reg(cc, CC1101_MDMCFG1, mdmcfg1);
+	if (ret)
+		return ret;
+	return cc1101_write_reg(cc, CC1101_MDMCFG0, best_m);
 }
 
 int cc1101_set_addr_filter(struct cc1101 *cc, u8 mode)
