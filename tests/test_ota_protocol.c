@@ -20,7 +20,7 @@ static void test_sizes(void)
     assert(OTA_ACK_PACKET_SIZE == 11);
     assert(OTA_FHSS_CONFIG_PACKET_SIZE == 33);
     assert(OTA_FHSS_ACTIVATE_PACKET_SIZE == 13);
-    assert(OTA_FHSS_SYNC_PACKET_SIZE == 13);
+    assert(OTA_FHSS_SYNC_PACKET_SIZE == 17);
     printf("[OK] 패킷 크기: START=%u DATA header=%u(+payload<=%u) END=%u ACK/NACK=%u\n",
            OTA_START_PACKET_SIZE, OTA_DATA_HEADER_SIZE, OTA_MAX_PAYLOAD_SIZE,
            OTA_END_PACKET_SIZE, OTA_ACK_PACKET_SIZE);
@@ -378,6 +378,7 @@ static void test_fhss_sync_roundtrip(void)
         .sequence = 0x1234u,
         .hop_index = 42u,
         .slot_number = 0x11223344u,
+        .public_seed = 0x55667788u,
     };
     ota_fhss_sync_fields_t decoded;
     uint8_t packet[OTA_FHSS_SYNC_PACKET_SIZE];
@@ -390,9 +391,12 @@ static void test_fhss_sync_roundtrip(void)
     assert(decoded.sequence == fields.sequence);
     assert(decoded.hop_index == fields.hop_index);
     assert(decoded.slot_number == fields.slot_number);
+    assert(decoded.public_seed == fields.public_seed);
     assert(packet[6] == 0x34 && packet[7] == 0x12);
     assert(packet[9] == 0x44 && packet[10] == 0x33 &&
            packet[11] == 0x22 && packet[12] == 0x11);
+    assert(packet[13] == 0x88 && packet[14] == 0x77 &&
+           packet[15] == 0x66 && packet[16] == 0x55);
 
     packet[1] = (uint8_t)(OTA_FHSS_SYNC_VERSION + 1u);
     assert(!ota_protocol_decode_fhss_sync(packet, sizeof(packet), &decoded));

@@ -64,12 +64,15 @@ extern "C" {
 
 /* FHSS control packets (all remain below the 60-byte RF body limit). */
 #define OTA_FHSS_ALGORITHM_VERSION       1u
-#define OTA_FHSS_SYNC_VERSION            1u
+/* v2(2026-08-24): public_seed(4바이트) 추가, 13->17바이트. 구버전(v1)
+ * 수신측은 sync_version 불일치로 이 패킷을 거부한다 — 하위호환 없음,
+ * 양쪽 다 새 버전으로 갱신 필요. */
+#define OTA_FHSS_SYNC_VERSION            2u
 #define OTA_FHSS_DEFAULT_SEED            0x46485353u
 #define OTA_FHSS_ZERO_SEED_FALLBACK      0x6D2B79F5u
 #define OTA_FHSS_CONFIG_PACKET_SIZE      33u
 #define OTA_FHSS_ACTIVATE_PACKET_SIZE    13u
-#define OTA_FHSS_SYNC_PACKET_SIZE        13u
+#define OTA_FHSS_SYNC_PACKET_SIZE        17u
 
 /* `sequence`/`total_chunks`는 plan_A.md 원안대로 32bit 유지(2026-08-11).
  * 한때 65,535개(16bit)면 충분해 보인다고 판단해 축소를 검토했으나, RF
@@ -197,6 +200,13 @@ typedef struct {
      * 연속 채널 프로필에서는 channel - first_channel과 같다. */
     uint8_t hop_index;
     uint32_t slot_number;
+    /* 세션(PTT/OTA 세션)마다 송신측이 새로 생성해 평문으로 싣는 값. 수신측은
+     * 로컬에만 있는 비밀(secret_seed)과 HMAC-SHA256으로 조합해 그 세션 전용
+     * hop_seed를 만든다 — 이 필드 자체는 공개돼도 안전하다(일방향 조합이라
+     * secret_seed 역산 불가). generation과는 역할이 다르다: generation은
+     * "사전에 배포/합의된 설정 버전", public_seed는 "이번 세션에만 쓰는
+     * 무작위값" — 두 필드는 서로 배타적이지 않다. */
+    uint32_t public_seed;
 } ota_fhss_sync_fields_t;
 
 #define OTA_DEVICE_ID_MAX 0xFFFFFFu
@@ -695,10 +705,10 @@ static inline bool ota_protocol_decode_fhss_activate(
     return true;
 }
 
-/* Runtime SYNC is deliberately 13 bytes, matching the current ESP32 packet
- * budget while using this protocol's Little Endian convention.
+/* Runtime SYNC is 17 bytes(v2), matching the current ESP32 packet budget
+ * while using this protocol's Little Endian convention.
  * Offset 0:type, 1:sync version, 2:generation(4), 6:sequence(2),
- * 8:hop index, 9:slot number(4). */
+ * 8:hop index, 9:slot number(4), 13:public_seed(4). */
 static inline size_t ota_protocol_encode_fhss_sync(
     uint8_t *packet_out, size_t packet_out_capacity,
     const ota_fhss_sync_fields_t *fields)
@@ -713,6 +723,7 @@ static inline size_t ota_protocol_encode_fhss_sync(
     ota_write_u16_le(&packet_out[6], fields->sequence);
     packet_out[8] = fields->hop_index;
     ota_write_u32_le(&packet_out[9], fields->slot_number);
+    ota_write_u32_le(&packet_out[13], fields->public_seed);
     return OTA_FHSS_SYNC_PACKET_SIZE;
 }
 
@@ -732,6 +743,7 @@ static inline bool ota_protocol_decode_fhss_sync(
     fields.sequence = ota_read_u16_le(&packet[6]);
     fields.hop_index = packet[8];
     fields.slot_number = ota_read_u32_le(&packet[9]);
+    fields.public_seed = ota_read_u32_le(&packet[13]);
     *fields_out = fields;
     return true;
 }
