@@ -36,6 +36,25 @@
 
 단말은 **ESP32-S3 + ESP-IDF/FreeRTOS**, 게이트웨이는 **Yocto로 직접 구운 리눅스 + Qt 앱**이다. 무선 모듈 제어는 단말에서는 펌웨어가, 게이트웨이에서는 리눅스 커널 모듈이 맡는다. 양쪽이 같은 규격으로 대화해야 하므로 패킷 정의는 별도 레포에 두고 공유한다.
 
+## FHSS는 어떻게 도는가
+
+두 단말이 **채널 테이블을 주고받지 않고도** 같은 순서로 채널을 옮겨 다니는 것이 핵심이다. 비결은 시드를 두 종류로 나눠 쓰는 데 있다.
+
+- **secret_seed** — TX와 RX가 빌드 시점에 미리 공유하는 비밀값. 무선으로는 절대 전송하지 않는다.
+- **public_seed** — PTT를 누를 때마다 새로 생성해, 세션 시작 시 공지 패킷으로 상대에게 알린다.
+
+두 값을 합쳐 세션마다 새 채널 순서를 만든다.
+
+```text
+secret_seed + public_seed  ──HMAC-SHA256──▶  hop_seed  ──shuffle──▶  세션별 채널 순서
+```
+
+- `slot_number`가 **언제** 옮길지를, `hop_seed`가 **어느 채널로** 옮길지를 정한다.
+- 같은 두 시드를 가진 단말은 동일한 채널 순서를 독립적으로 계산하므로, 별도 테이블 전송 없이 동시에 같은 채널로 이동한다.
+- 반대로 `secret_seed`가 다르면 public seed를 정상 수신해도 서로 완전히 다른 순서가 나온다 — 동기와 도청 저항을 동시에 얻는 구조다.
+
+동기가 잠깐 어긋나도 전체 채널을 다시 뒤지지 않고 예측 slot 주변(N → N-1 → N+1)만 국소 탐색해 빠르게 회복하며, 반복 실패 시에만 공통 시작 채널로 복귀한다. 시드 파생·동기·복구 알고리즘의 자세한 내용은 [`ota-protocol`](https://github.com/fhss-ota-radio/ota-protocol/tree/feature/fhss-sync-public-seed)과 [`firmware-esp32`](https://github.com/fhss-ota-radio/firmware-esp32/tree/develop)에 있다.
+
 ## 레포 구성
 
 | 레포 | 역할 | 기준 브랜치 |
@@ -132,6 +151,20 @@ flowchart TD
 ## 진행 상황
 
 단말 간 FHSS 음성 통신, 게이트웨이에서 단말로의 펌웨어 전송, 그리고 호핑 중인 상태에서의 펌웨어 전송까지 실기기로 확인했다. 전송받은 펌웨어는 무결성 검증을 통과한 뒤 실제로 부팅되는 것까지 확인된다.
+
+TX·RX serial 로그를 실시간으로 파싱하는 웹 모니터로 두 단말이 같은 slot에서 같은 채널로 이동하는지 눈으로 확인할 수 있다. 아래는 데모 실행 화면으로, 동기 성공률 100%와 연속 12 slot 일치, TX–RX 채널 offset 0 유지를 보여준다.
+
+<p align="center">
+  <img src="images/fhss-live-monitor.png" alt="FHSS 실시간 채널 모니터 — SYNCHRONIZED" width="820">
+  <br>
+  <sub>실시간 채널 모니터 — SYNCHRONIZED(slot 58 / CH 42), 아래 그래프는 TX·RX 채널 호핑 궤적이 일치하는 모습</sub>
+</p>
+
+<p align="center">
+  <img src="images/fhss-monitor-detail.png" alt="TX–RX 채널 offset 및 TX/RX 로그" width="820">
+  <br>
+  <sub>TX–RX 채널 offset 0 유지 · 채널 사용 빈도 분포 · TX/RX 실시간 로그</sub>
+</p>
 
 단계별 검증 내역과 남은 과제는 각 레포 README와 [`docs-architecture`](https://github.com/fhss-ota-radio/docs-architecture)에 정리돼 있다.
 
