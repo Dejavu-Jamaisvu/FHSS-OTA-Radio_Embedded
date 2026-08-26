@@ -36,24 +36,23 @@
 
 단말은 **ESP32-S3 + ESP-IDF/FreeRTOS**, 게이트웨이는 **Yocto로 직접 구운 리눅스 + Qt 앱**이다. 무선 모듈 제어는 단말에서는 펌웨어가, 게이트웨이에서는 리눅스 커널 모듈이 맡는다. 양쪽이 같은 규격으로 대화해야 하므로 패킷 정의는 별도 레포에 두고 공유한다.
 
-## FHSS는 어떻게 도는가
+## FHSS: 계속 채널을 바꾸며 통신하기
 
-두 단말이 **채널 테이블을 주고받지 않고도** 같은 순서로 채널을 옮겨 다니는 것이 핵심이다. 비결은 시드를 두 종류로 나눠 쓰는 데 있다.
+한 주파수에 머무르지 않고, 정해진 시간마다 정해진 패턴에 따라 송신 채널을 바꿔가며 신호를 전송한다. 송신기와 수신기가 같은 패턴으로 함께 도약하기 때문에, 매번 채널을 따로 약속하지 않아도 같은 채널에서 만난다.
 
-- **secret_seed** — TX와 RX가 빌드 시점에 미리 공유하는 비밀값. 무선으로는 절대 전송하지 않는다.
-- **public_seed** — PTT를 누를 때마다 새로 생성해, 세션 시작 시 공지 패킷으로 상대에게 알린다.
+<p align="center">
+  <img src="images/fhss-concept.png" alt="FHSS 개념 — 채널을 바꿔가며 통신" width="820">
+  <br>
+  <sub>정해진 패턴을 따라 채널을 옮겨 다니며 통신한다 — 간섭 회피 · 도청 방지 · 혼신 감소</sub>
+</p>
 
-두 값을 합쳐 세션마다 새 채널 순서를 만든다.
+채널을 계속 바꾸는 덕분에 세 가지 이점이 생긴다.
 
-```text
-secret_seed + public_seed  ──HMAC-SHA256──▶  hop_seed  ──shuffle──▶  세션별 채널 순서
-```
+- **간섭 회피** — 한 채널이 막혀도 금방 다른 채널로 옮겨가 통신을 이어간다.
+- **도청 방지** — 도약 패턴을 모르면 다음 채널을 예측할 수 없다.
+- **혼신 감소** — 여러 무전기가 동시에 써도 같은 채널에서 부딪칠 확률이 낮아진다.
 
-- `slot_number`가 **언제** 옮길지를, `hop_seed`가 **어느 채널로** 옮길지를 정한다.
-- 같은 두 시드를 가진 단말은 동일한 채널 순서를 독립적으로 계산하므로, 별도 테이블 전송 없이 동시에 같은 채널로 이동한다.
-- 반대로 `secret_seed`가 다르면 public seed를 정상 수신해도 서로 완전히 다른 순서가 나온다 — 동기와 도청 저항을 동시에 얻는 구조다.
-
-동기가 잠깐 어긋나도 전체 채널을 다시 뒤지지 않고 예측 slot 주변(N → N-1 → N+1)만 국소 탐색해 빠르게 회복하며, 반복 실패 시에만 공통 시작 채널로 복귀한다. 시드 파생·동기·복구 알고리즘의 자세한 내용은 [`ota-protocol`](https://github.com/fhss-ota-radio/ota-protocol/tree/feature/fhss-sync-public-seed)과 [`firmware-esp32`](https://github.com/fhss-ota-radio/firmware-esp32/tree/develop)에 있다.
+이 프로젝트에서는 두 단말이 **채널 표를 주고받지 않고도** 같은 순서로 도약하도록, 미리 공유한 비밀값과 세션마다 새로 정하는 값을 합쳐 채널 순서를 만든다. 서로 다른 비밀값을 가진 단말끼리는 아예 다른 순서가 나오므로 동기와 도청 저항을 동시에 얻는다. 시드 파생·동기·복구 알고리즘의 자세한 내용은 [`ota-protocol`](https://github.com/fhss-ota-radio/ota-protocol/tree/feature/fhss-sync-public-seed)과 [`firmware-esp32`](https://github.com/fhss-ota-radio/firmware-esp32/tree/develop)에 있다.
 
 ## 레포 구성
 
