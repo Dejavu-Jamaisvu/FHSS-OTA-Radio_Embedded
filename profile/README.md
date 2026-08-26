@@ -52,7 +52,7 @@
 - **도청 방지** — 도약 패턴을 모르면 다음 채널을 예측할 수 없다.
 - **혼신 감소** — 여러 무전기가 동시에 써도 같은 채널에서 부딪칠 확률이 낮아진다.
 
-이 프로젝트에서는 두 단말이 **채널 표를 주고받지 않고도** 같은 순서로 도약하도록, 미리 공유한 비밀값과 세션마다 새로 정하는 값을 합쳐 채널 순서를 만든다. 서로 다른 비밀값을 가진 단말끼리는 아예 다른 순서가 나오므로 동기와 도청 저항을 동시에 얻는다. 시드 파생·동기·복구 알고리즘의 자세한 내용은 [`ota-protocol`](https://github.com/fhss-ota-radio/ota-protocol/tree/feature/fhss-sync-public-seed)과 [`firmware-esp32`](https://github.com/fhss-ota-radio/firmware-esp32/tree/develop)에 있다.
+이 프로젝트에서는 두 단말이 seed값을 기반으로 같은 순서로 도약하도록, 미리 공유한 비밀값과 세션마다 새로 정하는 값을 합쳐 채널 순서를 만든다. 서로 다른 비밀값을 가진 단말끼리는 아예 다른 순서가 나오므로 동기와 도청 저항을 동시에 얻는다. 시드 파생·동기·복구 알고리즘의 자세한 내용은 [`ota-protocol`](https://github.com/fhss-ota-radio/ota-protocol/tree/feature/fhss-sync-public-seed)과 [`firmware-esp32`](https://github.com/fhss-ota-radio/firmware-esp32/tree/develop)에 있다.
 
 ## 레포 구성
 
