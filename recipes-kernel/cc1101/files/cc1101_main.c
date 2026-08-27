@@ -291,9 +291,10 @@ static ssize_t cc1101_read(struct file *filp, char __user *buf, size_t count,
 	return len;
 }
 
-/* 사용자 데이터와 드라이버가 만드는 FHSS SYNC가 같은 안전한 TX 경로를 쓴다.
- * 이 함수는 TX 완료 GDO0까지 기다리므로 호출이 끝나면 다시 RX 상태이다. */
-int cc1101_transmit_packet(struct cc1101 *cc, const u8 *payload, size_t len)
+/* tx_lock을 보유한 호출자가 사용하는 공통 TX 본체. TX 완료 GDO0까지
+ * 기다리므로 호출이 끝나면 다시 RX 상태이다. */
+int cc1101_transmit_packet_locked(struct cc1101 *cc, const u8 *payload,
+				  size_t len)
 {
 	u8 txbuf[CC1101_MAX_PACKET_LEN + 1];
 	long timeout;
@@ -312,6 +313,8 @@ int cc1101_transmit_packet(struct cc1101 *cc, const u8 *payload, size_t len)
 	if (ret)
 		return ret;
 
+	/* tx_lock을 사용하는 정상 경로에서는 TX가 겹치지 않는다. 이 검사는
+	 * 예상하지 못한 상태 손상을 방어하기 위해 남겨 둔다. */
 	if (cc->state == CC1101_STATE_TX) {
 		mutex_unlock(&cc->lock);
 		return -EBUSY;
@@ -371,10 +374,23 @@ int cc1101_transmit_packet(struct cc1101 *cc, const u8 *payload, size_t len)
 		cc1101_enter_rx_recover(cc);
 	}
 	mutex_unlock(&cc->lock);
+	return ret;
+}
+
+int cc1101_transmit_packet(struct cc1101 *cc, const u8 *payload, size_t len)
+{
+	int ret;
+
+	/* FHSS 작업 스레드의 SYNC와 사용자 write()가 겹치지 않게 할 뿐 아니라,
+	 * 슬롯 경계에서 기다리는 호핑 worker가 연속 OTA DATA 사이에 채널을
+	 * 바꿀 기회를 얻도록 TX 한 건 단위로 잠금을 놓는다. */
+	ret = mutex_lock_interruptible(&cc->tx_lock);
 	if (ret)
 		return ret;
 
-	return 0;
+	ret = cc1101_transmit_packet_locked(cc, payload, len);
+	mutex_unlock(&cc->tx_lock);
+	return ret;
 }
 
 static ssize_t cc1101_write(struct file *filp, const char __user *buf,
@@ -638,6 +654,7 @@ static int cc1101_probe(struct spi_device *spi)
 
 	cc->spi = spi;
 	mutex_init(&cc->lock);
+	mutex_init(&cc->tx_lock);
 	init_completion(&cc->tx_done);
 	init_waitqueue_head(&cc->rx_wait);
 	atomic_set(&cc->open_count, 0);

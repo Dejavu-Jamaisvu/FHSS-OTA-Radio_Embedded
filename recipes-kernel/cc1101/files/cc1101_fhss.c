@@ -121,15 +121,21 @@ static void cc1101_fhss_hop_worker(struct kthread_work *work)
 {
 	struct cc1101_fhss *fhss =
 		container_of(work, struct cc1101_fhss, hop_work);
-	u64 slot_ns, now_ns, slot;
+	u64 slot_ns, now_ns, slot, slot_start_ns;
 	u8 channel;
 	int ret;
 
 	mutex_lock(&fhss->config_lock);
-	if (fhss->state != CC1101_FHSS_SYNCHRONIZED) {
+	if (fhss->state != CC1101_FHSS_ACQUIRING &&
+	    fhss->state != CC1101_FHSS_SYNCHRONIZED) {
 		mutex_unlock(&fhss->config_lock);
 		return;
 	}
+
+	/* 사용자 OTA write() 한 건이 끝날 때까지 기다린 뒤 다음 write()보다 먼저
+	 * 채널 전환과 SYNC를 수행한다. 예전에는 슬롯 경계에 TX 중이면 호핑을
+	 * 한 슬롯 통째로 생략해 상대와 채널이 어긋났고, 대량 재전송을 유발했다. */
+	mutex_lock(&fhss->cc->tx_lock);
 
 	/* 타이머가 늦게 실행됐을 수도 있으므로 단순히 슬롯을 1 증가시키지 않고,
 	 * 실제 경과 시간으로 지금 있어야 할 슬롯을 다시 계산한다. */
@@ -150,19 +156,8 @@ static void cc1101_fhss_hop_worker(struct kthread_work *work)
 		goto failed;
 
 	mutex_lock(&fhss->cc->lock);
-	/* 송신 중 채널을 바꾸면 전송 중인 패킷이 끊긴다. 이 슬롯의 변경은
-	 * 건너뛰고 다음 슬롯에서 현재 시각 기준 채널로 다시 맞춘다. */
-	if (fhss->cc->state == CC1101_STATE_TX)
-		ret = -EBUSY;
-	else
-		ret = cc1101_switch_channel(fhss->cc, channel);
+	ret = cc1101_switch_channel(fhss->cc, channel);
 	mutex_unlock(&fhss->cc->lock);
-	if (ret == -EBUSY) {
-		/* 송신을 중단하지 않고 다음 절대 슬롯에서 다시 동기화한다. */
-		cc1101_fhss_schedule_next(fhss);
-		mutex_unlock(&fhss->config_lock);
-		return;
-	}
 	if (ret)
 		goto failed;
 
@@ -175,13 +170,21 @@ static void cc1101_fhss_hop_worker(struct kthread_work *work)
 		 * 제어 패킷을 직접 만들 필요 없이 평소처럼 write()만 사용한다.
 		 * 채널은 guard만큼 먼저 바꿨으므로 명목 슬롯 경계까지 기다렸다가
 		 * SYNC를 보내 SLAVE가 다음 채널을 준비할 시간을 일정하게 만든다. */
-		if (fhss->config.hop.channel_switch_guard_us)
-			usleep_range(fhss->config.hop.channel_switch_guard_us,
-				fhss->config.hop.channel_switch_guard_us + 500);
+		/* 앞 DATA의 완료를 기다리느라 슬롯 경계를 이미 지났다면 guard 전체를
+		 * 다시 자지 않는다. 아직 경계 전일 때만 남은 시간만큼 기다린다. */
+		slot_start_ns = fhss->reference_time_ns + slot * slot_ns;
+		now_ns = ktime_get_ns();
+		if (slot_start_ns > now_ns) {
+			u64 wait_us = div64_u64(slot_start_ns - now_ns,
+						 NSEC_PER_USEC);
+
+			if (wait_us)
+				usleep_range(wait_us, wait_us + 500);
+		}
 		cc1101_fhss_encode_sync(fhss, slot, sync_packet);
-		ret = cc1101_transmit_packet(fhss->cc, sync_packet,
-					      sizeof(sync_packet));
-		if (ret && ret != -EBUSY)
+		ret = cc1101_transmit_packet_locked(fhss->cc, sync_packet,
+						     sizeof(sync_packet));
+		if (ret)
 			goto failed;
 	} else if (slot > fhss->last_sync_slot) {
 		fhss->sync_misses++;
@@ -202,17 +205,20 @@ static void cc1101_fhss_hop_worker(struct kthread_work *work)
 			dev_warn(&fhss->cc->spi->dev,
 				 "FHSS SYNC 상실, 채널 %u에서 재탐색\n",
 				 fhss->current_channel);
+			mutex_unlock(&fhss->cc->tx_lock);
 			mutex_unlock(&fhss->config_lock);
 			return;
 		}
 	}
 	cc1101_fhss_schedule_next(fhss);
+	mutex_unlock(&fhss->cc->tx_lock);
 	mutex_unlock(&fhss->config_lock);
 	return;
 
 failed:
 	fhss->last_error = ret;
 	fhss->state = CC1101_FHSS_CONFIGURED;
+	mutex_unlock(&fhss->cc->tx_lock);
 	mutex_unlock(&fhss->config_lock);
 }
 
@@ -256,12 +262,52 @@ static int cc1101_fhss_apply_profile(struct cc1101_fhss *fhss)
 {
 	const struct cc1101_fhss_rf_profile *rf = &fhss->config.rf;
 	struct cc1101 *cc = fhss->cc;
-	int ret, rx_ret;
+	struct cc1101_fhss_rf_backup *saved = &fhss->saved_rf;
+	int ret, restore_ret, rx_ret;
+
+	/* 이 함수와 restore 함수는 모두 cc->lock을 잡은 상태에서 레지스터에
+	 * 접근한다. FHSS가 실제로 변경하는 레지스터를 빠짐없이 저장한다.
+	 * set_freq_hz()는 FREQ2/1/0을, set_channel_spacing_hz()는
+	 * MDMCFG1/0을 변경하므로 겉으로 직접 write하는 여섯 개만 저장해서는
+	 * 고정 채널 프로파일을 완전히 복구할 수 없다. */
+#define SAVE_REG(_field, _reg) \
+	do { \
+		ret = cc1101_read_reg(cc, (_reg), &saved->_field); \
+		if (ret) \
+			goto out_rx; \
+	} while (0)
+
+#define RESTORE_REG(_field, _reg) \
+	do { \
+		restore_ret = cc1101_write_reg(cc, (_reg), saved->_field); \
+		if (!ret && restore_ret) \
+			ret = restore_ret; \
+	} while (0)
 
 	/* 주파수 관련 레지스터를 바꾸는 동안 RX/TX가 시작되지 않도록 라디오를
 	 * IDLE로 만든 뒤 한 번에 설정하고, 마지막에 다시 RX로 들어간다. */
 	mutex_lock(&cc->lock);
 	ret = cc1101_enter_idle(cc);
+	if (ret)
+		goto out_unlock;
+
+	/* 정상 stop 또는 시작 실패 롤백이 끝날 때까지 원본을 유지한다. */
+	if (!saved->valid) {
+		SAVE_REG(freq2, CC1101_FREQ2);
+		SAVE_REG(freq1, CC1101_FREQ1);
+		SAVE_REG(freq0, CC1101_FREQ0);
+		SAVE_REG(sync1, CC1101_SYNC1);
+		SAVE_REG(sync0, CC1101_SYNC0);
+		SAVE_REG(mdmcfg4, CC1101_MDMCFG4);
+		SAVE_REG(mdmcfg3, CC1101_MDMCFG3);
+		SAVE_REG(mdmcfg1, CC1101_MDMCFG1);
+		SAVE_REG(mdmcfg0, CC1101_MDMCFG0);
+		SAVE_REG(pktctrl1, CC1101_PKTCTRL1);
+		SAVE_REG(pktctrl0, CC1101_PKTCTRL0);
+		SAVE_REG(channr, CC1101_CHANNR);
+		saved->valid = true;
+	}
+
 	if (!ret)
 		ret = cc1101_set_freq_hz(cc, rf->base_freq_hz);
 	if (!ret)
@@ -279,11 +325,90 @@ static int cc1101_fhss_apply_profile(struct cc1101_fhss *fhss)
 		ret = cc1101_write_reg(cc, CC1101_PKTCTRL1, rf->pktctrl1);
 	if (!ret)
 		ret = cc1101_write_reg(cc, CC1101_PKTCTRL0, rf->pktctrl0);
+	if (ret && saved->valid) {
+		/* 프로파일 적용이 중간에 실패해도 앞에서 이미 쓴 레지스터를
+		 * 그대로 남기지 않는다. 원래 오류는 보존하고 복구는 최선을
+		 * 다해 모든 레지스터에 시도한다. */
+		RESTORE_REG(freq2, CC1101_FREQ2);
+		RESTORE_REG(freq1, CC1101_FREQ1);
+		RESTORE_REG(freq0, CC1101_FREQ0);
+		RESTORE_REG(sync1, CC1101_SYNC1);
+		RESTORE_REG(sync0, CC1101_SYNC0);
+		RESTORE_REG(mdmcfg4, CC1101_MDMCFG4);
+		RESTORE_REG(mdmcfg3, CC1101_MDMCFG3);
+		RESTORE_REG(mdmcfg1, CC1101_MDMCFG1);
+		RESTORE_REG(mdmcfg0, CC1101_MDMCFG0);
+		RESTORE_REG(pktctrl1, CC1101_PKTCTRL1);
+		RESTORE_REG(pktctrl0, CC1101_PKTCTRL0);
+		RESTORE_REG(channr, CC1101_CHANNR);
+	}
+out_rx:
 	rx_ret = cc1101_enter_rx_recover(cc);
 	if (!ret)
 		ret = rx_ret;
+out_unlock:
 	mutex_unlock(&cc->lock);
 
+#undef RESTORE_REG
+#undef SAVE_REG
+
+	return ret;
+}
+
+/* FHSS 시작 전에 저장한 물리계층 설정으로 돌아간 뒤 예약 채널에서 RX를
+ * 다시 시작한다. 호출자는 FHSS timer/worker가 정지했음을 보장해야 한다. */
+static int cc1101_fhss_restore_profile(struct cc1101_fhss *fhss)
+{
+	struct cc1101_fhss_rf_backup *saved = &fhss->saved_rf;
+	struct cc1101 *cc = fhss->cc;
+	int ret = 0, write_ret, rx_ret;
+
+	mutex_lock(&cc->lock);
+	ret = cc1101_enter_idle(cc);
+	if (ret)
+		goto out;
+	if (!saved->valid)
+		goto restart_rx;
+
+#define RESTORE_SAVED(_field, _reg) \
+	do { \
+		write_ret = cc1101_write_reg(cc, (_reg), saved->_field); \
+		if (!ret && write_ret) \
+			ret = write_ret; \
+	} while (0)
+
+	RESTORE_SAVED(freq2, CC1101_FREQ2);
+	RESTORE_SAVED(freq1, CC1101_FREQ1);
+	RESTORE_SAVED(freq0, CC1101_FREQ0);
+	RESTORE_SAVED(sync1, CC1101_SYNC1);
+	RESTORE_SAVED(sync0, CC1101_SYNC0);
+	RESTORE_SAVED(mdmcfg4, CC1101_MDMCFG4);
+	RESTORE_SAVED(mdmcfg3, CC1101_MDMCFG3);
+	RESTORE_SAVED(mdmcfg1, CC1101_MDMCFG1);
+	RESTORE_SAVED(mdmcfg0, CC1101_MDMCFG0);
+	RESTORE_SAVED(pktctrl1, CC1101_PKTCTRL1);
+	RESTORE_SAVED(pktctrl0, CC1101_PKTCTRL0);
+	RESTORE_SAVED(channr, CC1101_CHANNR);
+
+#undef RESTORE_SAVED
+
+	/* 일부 write가 실패하면 valid를 유지해 다음 STOP/재시도에서 원본을
+	 * 잃지 않게 한다. 그래도 채널 복귀와 RX 재진입은 가능한 만큼 수행한다. */
+	if (!ret)
+		saved->valid = false;
+
+	restart_rx:
+	/* 프로파일을 복원한 시점에는 IDLE이다. 이전 FHSS 패킷과 overflow
+	 * 상태를 남기지 않도록 RX FIFO를 명시적으로 비운 뒤 고정 채널 RX로
+	 * 다시 들어간다. */
+	write_ret = cc1101_strobe(cc, CC1101_SFRX);
+	if (!ret)
+		ret = write_ret;
+	rx_ret = cc1101_enter_rx(cc);
+	if (!ret)
+		ret = rx_ret;
+out:
+	mutex_unlock(&cc->lock);
 	return ret;
 }
 
@@ -348,6 +473,7 @@ int cc1101_fhss_set_config(struct cc1101 *cc,
 
 	mutex_lock(&fhss->config_lock);
 	if (fhss->state == CC1101_FHSS_SEARCHING ||
+	    fhss->state == CC1101_FHSS_ACQUIRING ||
 	    fhss->state == CC1101_FHSS_SYNCHRONIZED ||
 	    fhss->state == CC1101_FHSS_STOPPING) {
 		ret = -EBUSY;
@@ -370,8 +496,6 @@ out:
 int cc1101_fhss_start(struct cc1101 *cc, u8 role)
 {
 	struct cc1101_fhss *fhss = cc->fhss;
-	u8 sync_packet[CC1101_FHSS_SYNC_PACKET_SIZE];
-	int i;
 	int ret;
 
 	if (!fhss)
@@ -388,10 +512,10 @@ int cc1101_fhss_start(struct cc1101 *cc, u8 role)
 
 	ret = cc1101_fhss_apply_profile(fhss);
 	if (ret)
-		goto out;
+		goto restore_profile;
 	ret = fhss->algorithm->init(fhss);
 	if (ret)
-		goto out;
+		goto restore_profile;
 
 	/* 어느 시각에 START ioctl이 호출됐든 처음에는 모두 설정에 지정한
 	 * rendezvous_channel로 모인다. 여기서 SYNC를 잡은 뒤에만 호핑한다. */
@@ -400,7 +524,7 @@ int cc1101_fhss_start(struct cc1101 *cc, u8 role)
 				     fhss->config.hop.rendezvous_channel);
 	mutex_unlock(&cc->lock);
 	if (ret)
-		goto out;
+		goto restore_profile;
 
 	fhss->role = role;
 	fhss->last_error = 0;
@@ -424,24 +548,26 @@ int cc1101_fhss_start(struct cc1101 *cc, u8 role)
 		goto out;
 	}
 
-	/* SLAVE가 시작 명령을 조금 늦게 처리해도 잡을 수 있도록 MASTER는
-	 * 랑데부 채널에서 slot 0 SYNC를 세 번 먼저 보낸다. */
-	for (i = 0; i < CC1101_FHSS_SYNC_ACQUIRE_COUNT; i++) {
-		cc1101_fhss_encode_sync(fhss, 0, sync_packet);
-		ret = cc1101_transmit_packet(cc, sync_packet,
-					      sizeof(sync_packet));
-		if (ret)
-			goto out;
-		if (i != CC1101_FHSS_SYNC_ACQUIRE_COUNT - 1)
-			msleep(20);
-	}
-
-	/* slot 0의 실제 경계는 지금보다 guard만큼 뒤로 둔다. 바로 이어서
-	 * 보내는 SYNC를 받은 SLAVE도 같은 계산으로 이 경계를 복원한다. */
+	/* 기준 시각을 먼저 확정한 뒤 작업 스레드가 실제 slot 0 경계에서 첫
+	 * SYNC를 보낸다. 예전처럼 같은 slot 0을 20ms 간격으로 세 번 보내면
+	 * 첫 패킷으로 시계를 맞춘 ESP32가 뒤의 두 패킷을 시간 범위 밖으로
+	 * 판단한다. 이제 SYNC는 실제 슬롯마다 한 번씩만 전송한다. */
 	fhss->reference_time_ns = ktime_get_ns() +
 		(u64)fhss->config.hop.channel_switch_guard_us * NSEC_PER_USEC;
 	fhss->state = CC1101_FHSS_SYNCHRONIZED;
 	kthread_queue_work(&fhss->worker, &fhss->hop_work);
+	goto out;
+
+restore_profile:
+	/* RF 프로파일 적용 뒤의 초기화가 실패한 경우에도 다음 고정 채널
+	 * DISCOVER가 깨지지 않도록 시작 전 설정으로 즉시 롤백한다. */
+	{
+		int restore_ret = cc1101_fhss_restore_profile(fhss);
+
+		if (restore_ret)
+			dev_err(&cc->spi->dev,
+				"FHSS start rollback failed: %d\n", restore_ret);
+	}
 out:
 	mutex_unlock(&fhss->config_lock);
 	return ret;
@@ -450,13 +576,15 @@ out:
 int cc1101_fhss_stop(struct cc1101 *cc)
 {
 	struct cc1101_fhss *fhss = cc->fhss;
+	u8 restored_channel;
 	int ret = 0;
 
 	if (!fhss)
 		return -ENODEV;
 
 	mutex_lock(&fhss->config_lock);
-	if (fhss->state == CC1101_FHSS_DISABLED) {
+	if (fhss->state == CC1101_FHSS_DISABLED &&
+	    !fhss->saved_rf.valid) {
 		mutex_unlock(&fhss->config_lock);
 		return 0;
 	}
@@ -470,17 +598,18 @@ int cc1101_fhss_stop(struct cc1101 *cc)
 	/* 호핑을 끝낸 뒤에는 OTA/초기 접속에 쓰는 예약 채널로 돌아간다.
 	 * 따라서 사용자 앱은 STOP 다음에 SET_CHANNEL을 따로 호출하지 않아도
 	 * 다시 펌웨어 업데이트 패킷을 주고받을 수 있다. */
-	mutex_lock(&cc->lock);
-	ret = cc1101_switch_channel(cc, fhss->config.hop.reserved_channel);
-	mutex_unlock(&cc->lock);
+	restored_channel = fhss->saved_rf.valid ?
+		fhss->saved_rf.channr : fhss->config.hop.reserved_channel;
+	ret = cc1101_fhss_restore_profile(fhss);
 
 	mutex_lock(&fhss->config_lock);
 	if (!ret)
-		fhss->current_channel = fhss->config.hop.reserved_channel;
+		fhss->current_channel = restored_channel;
 	else
 		fhss->last_error = ret;
-	fhss->state = fhss->algorithm ? CC1101_FHSS_CONFIGURED :
-		CC1101_FHSS_DISABLED;
+	/* STOP 뒤에는 반드시 새 CONFIG부터 시작하게 한다. RF 하드웨어와
+	 * 소프트웨어 상태를 모두 고정 채널 기준으로 확정하기 위함이다. */
+	fhss->state = CC1101_FHSS_DISABLED;
 	mutex_unlock(&fhss->config_lock);
 	return ret;
 }
@@ -501,6 +630,7 @@ bool cc1101_fhss_is_sync_packet(struct cc1101 *cc,
 	state = READ_ONCE(fhss->state);
 	return READ_ONCE(fhss->role) == CC1101_FHSS_ROLE_SLAVE &&
 		(state == CC1101_FHSS_SEARCHING ||
+		 state == CC1101_FHSS_ACQUIRING ||
 		 state == CC1101_FHSS_SYNCHRONIZED);
 }
 
@@ -521,6 +651,7 @@ void cc1101_fhss_handle_sync(struct cc1101 *cc, const u8 *payload,
 	mutex_lock(&fhss->config_lock);
 	if (fhss->role != CC1101_FHSS_ROLE_SLAVE ||
 	    (fhss->state != CC1101_FHSS_SEARCHING &&
+	     fhss->state != CC1101_FHSS_ACQUIRING &&
 	     fhss->state != CC1101_FHSS_SYNCHRONIZED))
 		goto out;
 
@@ -542,7 +673,8 @@ void cc1101_fhss_handle_sync(struct cc1101 *cc, const u8 *payload,
 	expected_index = expected_channel - fhss->config.hop.first_channel;
 	if (sync.hop_index != expected_index)
 		goto out;
-	if (fhss->state == CC1101_FHSS_SYNCHRONIZED &&
+	if ((fhss->state == CC1101_FHSS_ACQUIRING ||
+	     fhss->state == CC1101_FHSS_SYNCHRONIZED) &&
 	    expected_channel != fhss->current_channel)
 		goto out;
 
@@ -552,6 +684,15 @@ void cc1101_fhss_handle_sync(struct cc1101 *cc, const u8 *payload,
 	if ((u64)sync.slot_number * slot_ns > rx_time_ns)
 		goto out;
 	candidate_reference = rx_time_ns - (u64)sync.slot_number * slot_ns;
+	/* 획득 중에는 연속된 실제 슬롯의 SYNC만 개수에 포함한다. 같은 슬롯을
+	 * 다시 보낸 패킷은 버리고, 중간 슬롯을 놓쳤다면 현재 패킷부터 다시
+	 * 세기 시작한다. 채널 추적 자체는 유지하므로 재탐색 비용은 없다. */
+	if (fhss->state == CC1101_FHSS_ACQUIRING) {
+		if (sync.slot_number <= fhss->last_sync_slot)
+			goto out;
+		if (sync.slot_number != fhss->last_sync_slot + 1)
+			fhss->acquire_progress = 0;
+	}
 	fhss->sync_packets++;
 	fhss->last_rx_sequence = sync.sequence;
 	fhss->have_last_rx_sequence = true;
@@ -559,15 +700,27 @@ void cc1101_fhss_handle_sync(struct cc1101 *cc, const u8 *payload,
 	fhss->sync_misses = 0;
 
 	if (fhss->state == CC1101_FHSS_SEARCHING) {
-		/* 우연히 한 번 잡힌 패킷으로 바로 호핑하지 않고 세 번 연속 같은
-		 * generation의 SYNC를 확인해 잘못된 동기 획득을 줄인다. */
-		fhss->acquire_progress++;
-		if (fhss->acquire_progress < CC1101_FHSS_SYNC_ACQUIRE_COUNT)
-			goto out;
-
+		/* 첫 SYNC만으로 동기 완료라고 표시하지는 않지만, 다음 SYNC는 이미
+		 * 다음 호핑 채널에서 오므로 여기서부터 MASTER의 채널을 따라간다. */
 		fhss->reference_time_ns = candidate_reference;
 		fhss->current_slot = sync.slot_number;
 		fhss->current_channel = expected_channel;
+		fhss->acquire_progress = 1;
+		fhss->state = CC1101_FHSS_ACQUIRING;
+		cc1101_fhss_schedule_next(fhss);
+		goto out;
+	}
+
+	if (fhss->state == CC1101_FHSS_ACQUIRING) {
+		/* 실제 슬롯마다 도착한 정상 SYNC 세 개를 확인해야 synchronized가
+		 * 된다. 같은 slot을 빠르게 반복해서 개수만 채우지 않는다. */
+		fhss->reference_time_ns = candidate_reference;
+		fhss->current_slot = sync.slot_number;
+		fhss->acquire_progress++;
+		cc1101_fhss_schedule_next(fhss);
+		if (fhss->acquire_progress < CC1101_FHSS_SYNC_ACQUIRE_COUNT)
+			goto out;
+
 		fhss->state = CC1101_FHSS_SYNCHRONIZED;
 		dev_info(&cc->spi->dev,
 			 "FHSS SYNC 획득: generation=%u slot=%u channel=%u\n",
@@ -606,6 +759,7 @@ void cc1101_fhss_get_status(struct cc1101 *cc,
 
 	mutex_lock(&fhss->config_lock);
 	status->enabled = fhss->state == CC1101_FHSS_SEARCHING ||
+		fhss->state == CC1101_FHSS_ACQUIRING ||
 		fhss->state == CC1101_FHSS_SYNCHRONIZED;
 	status->synchronized =
 		fhss->state == CC1101_FHSS_SYNCHRONIZED;
@@ -618,4 +772,3 @@ void cc1101_fhss_get_status(struct cc1101 *cc,
 	status->sync_packets = fhss->sync_packets;
 	mutex_unlock(&fhss->config_lock);
 }
-

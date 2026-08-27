@@ -18,4 +18,3 @@ struct cc1101_hop_algorithm {
 const struct cc1101_hop_algorithm *cc1101_hop_get_algorithm(u32 algorithm_id);
 
 #endif /* _CC1101_HOP_H_ */
-

@@ -15,10 +15,32 @@
 struct cc1101;
 struct cc1101_hop_algorithm;
 
+/* FHSS 프로파일이 임시로 덮어쓰는 CC1101 RF 레지스터의 원본 값이다.
+ * 호핑을 끝내면 채널뿐 아니라 이 값들도 되돌려야 고정 채널 통신이
+ * FHSS 시작 전과 동일한 물리계층 설정으로 다시 동작한다. */
+struct cc1101_fhss_rf_backup {
+	u8 freq2;
+	u8 freq1;
+	u8 freq0;
+	u8 sync1;
+	u8 sync0;
+	u8 mdmcfg4;
+	u8 mdmcfg3;
+	u8 mdmcfg1;
+	u8 mdmcfg0;
+	u8 pktctrl1;
+	u8 pktctrl0;
+	u8 channr;
+	bool valid;
+};
+
 enum cc1101_fhss_state {
 	CC1101_FHSS_DISABLED,
 	CC1101_FHSS_CONFIGURED,
 	CC1101_FHSS_SEARCHING,
+	/* 첫 SYNC는 받았지만 아직 3회 확인이 끝나지 않은 상태다.
+	 * 이때부터는 MASTER의 슬롯/채널을 따라가야 다음 SYNC도 받을 수 있다. */
+	CC1101_FHSS_ACQUIRING,
 	CC1101_FHSS_SYNCHRONIZED,
 	CC1101_FHSS_STOPPING,
 };
@@ -43,6 +65,7 @@ struct cc1101_fhss {
 	u32 sync_misses;
 	u32 acquire_progress;
 	u64 last_sync_slot;
+	struct cc1101_fhss_rf_backup saved_rf;
 
 	u8 permutation[CC1101_FHSS_MAX_CHANNELS];
 
@@ -74,4 +97,3 @@ void cc1101_fhss_handle_sync(struct cc1101 *cc, const u8 *payload,
 			     size_t len, u64 rx_time_ns);
 
 #endif
-
