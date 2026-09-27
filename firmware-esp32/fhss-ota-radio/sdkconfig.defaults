@@ -1,0 +1,43 @@
+# 기본값(100Hz, tick 10ms)이면 rotary_encoder/ptt_button처럼 10ms보다 짧은
+# 폴링 주기를 쓰는 태스크의 vTaskDelay(pdMS_TO_TICKS(x))가 정수 나눗셈으로
+# 0틱이 돼 사실상 busy-loop이 된다(2026-08-12 실기기에서 CPU 99% 점유로
+# 확인, 로컬 troubleshoot/task_wdt-poll_ms_zero_tick_busyloop.md 참고).
+# sdkconfig(git 비추적) 안에만 넣으면 이 저장소를 새로 clone/build하는
+# 사람에게 안 퍼지므로 여기(git 추적)에도 명시해둔다 — 이미 로컬 sdkconfig가
+# 있는 사람은 이 파일이 자동 병합되지 않으니 직접 CONFIG_FREERTOS_HZ를
+# 1000으로 올려야 한다(menuconfig > Component config > FreeRTOS > Kernel >
+# Tick rate, 또는 sdkconfig에서 직접 수정).
+CONFIG_FREERTOS_HZ=1000
+
+# TEMP(main/main.c의 task_stats_task 진단 코드가 쓰는 설정, 그 코드 지울 때
+# 이 블록도 같이 지울 것): vTaskGetRunTimeStats()로 태스크별 실측 CPU
+# 점유율을 보려면 필요. main.c 쪽은 이 옵션이 꺼진 로컬에서도(CONFIG_FREERTOS_
+# GENERATE_RUN_TIME_STATS가 0이면) 빌드가 깨지지 않도록 #if로 방어돼 있어서
+# 이 블록이 없어도 빌드 자체는 되지만, 없으면 진단 로그가 안 찍힘.
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+CONFIG_FREERTOS_RUN_TIME_COUNTER_TYPE_U32=y
+CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=y
+
+# 제품/OTA 테스트가 동일한 A/B 레이아웃을 사용하도록 새 sdkconfig에도
+# 루트 partitions.csv를 적용한다. partitions.csv는 정확히 8 MiB(0x800000)
+# 안에서 끝나도록 잡혀있어 N16R8/N8R8 두 보드가 그대로 공유해도 안전하다.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# 새 OTA 이미지의 첫 부팅이 제품 self-test를 통과하기 전에는 확정하지 않는다.
+# 검증 전 crash/reset 또는 명시적 실패 시 bootloader가 이전 슬롯으로 복귀한다.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# 팀 대부분이 쓰는 최종 목표 보드(N16R8, Flash 16MB) 기준값 — VSCode
+# 빌드 버튼/`idf.py build`를 옵션 없이 그냥 실행해도 이게 적용된다.
+# 부품 수급 문제로 N8R8(Flash 8MB)을 병행 개발 중인 사람만 아래처럼
+# 오버레이 파일을 추가로 얹어서 빌드할 것(README 참고):
+#   idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.n8r8" build
+# 보드를 바꿔서 빌드할 땐 반드시 먼저 정리할 것(기존 sdkconfig가 있으면
+# SDKCONFIG_DEFAULTS가 반영되지 않음 — Flash 크기가 실제 칩과 안 맞는
+# 바이너리를 그대로 플래시하면 아주 초기 단계에서 부팅이 죽는다):
+#   rm -f sdkconfig && idf.py fullclean   (fullclean만으로는 sdkconfig가 안 지워짐)
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y

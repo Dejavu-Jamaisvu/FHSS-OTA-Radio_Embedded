@@ -1,0 +1,19 @@
+idf_component_register(
+    SRCS
+        "source/ota_client.c"
+        "source/ota_batch_cache.c"
+        "source/ota_writer.c"
+        "source/ota_consumer.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "source"
+    REQUIRES
+        ota_protocol
+        fhss_config_store
+    PRIV_REQUIRES
+        app_update
+        esp_partition
+        freertos
+        mbedtls
+)

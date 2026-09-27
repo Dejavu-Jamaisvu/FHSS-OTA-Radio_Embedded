@@ -1,0 +1,160 @@
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "fhss_fsm.h"
+#include "fhss_diagnostics.h"
+#include "fhss_sync_controller.h"
+#include "rf_transport.h"
+
+typedef enum {
+    FHSS_SERVICE_ROLE_TX = 0,
+    FHSS_SERVICE_ROLE_RX,
+} fhss_service_role_t;
+
+typedef enum {
+    FHSS_SERVICE_EVENT_SYNC_ACQUIRED = 0,
+    FHSS_SERVICE_EVENT_SYNC_LOST,
+    FHSS_SERVICE_EVENT_ERROR,
+} fhss_service_event_t;
+
+typedef void (*fhss_service_event_callback_t)(
+    fhss_service_event_t event,
+    void *context
+);
+
+typedef enum {
+    FHSS_SERVICE_DATA_CONTINUE = 0,
+    FHSS_SERVICE_DATA_SESSION_END,
+} fhss_service_data_action_t;
+
+typedef fhss_service_data_action_t (*fhss_service_data_callback_t)(
+    const uint8_t *data,
+    size_t length,
+    void *context
+);
+
+/* TX 세션 시작 시 새로 생성된 public_seed로부터 실제 hop_seed를 파생시킨다.
+ * fhss_service는 이 파생 로직(비밀키 조합 방식 등)을 모른다 — secret_seed를
+ * 쥐고 있는 상위 계층(fhss_audio_adapter)이 구현해서 콜백으로 넘긴다. */
+typedef uint32_t (*fhss_service_derive_hop_seed_callback_t)(
+    uint32_t public_seed,
+    void *context
+);
+
+typedef struct {
+    fhss_service_role_t role;
+    rf_transport_config_t radio;
+    const uint8_t *channels;
+    size_t channel_count;
+    uint32_t hop_seed;
+    /* OTA로 사전 배포된 설정 버전 — SYNC 수신 시 이 값과 안 맞으면 통째로
+     * 거부된다(fhss_core.c). public_seed와는 역할이 다르다: generation은
+     * "이 기기가 지금 어떤 설정을 쓰기로 사전 합의됐는지", public_seed는
+     * "이번 세션 홉 패턴을 얼마나 다르게 할지" — 서로 배타적이지 않다. */
+    uint32_t generation;
+    /* TX가 세션마다 새로 생성해 SYNC와 별도로 announce 패킷에 실어 보내는 값
+     * (RX는 수신 값을 그대로 따라간다). derive_hop_seed가 설정된 경우에만
+     * 의미가 있다. */
+    uint32_t public_seed;
+    fhss_service_derive_hop_seed_callback_t derive_hop_seed;
+    uint8_t reserved_channel;
+    uint32_t slot_duration_us;
+    uint32_t channel_switch_guard_us;
+    /* 재배정(2026-08-17): 예전엔 channel_switch_guard_us(5ms, 채널 전환용
+     * 리드타임)를 수신 타이밍 판정 허용 오차로도 그대로 재사용했는데, 이
+     * 둘은 완전히 다른 예산이다 — 채널 전환은 SPI/CC1101 처리시간만 확보하면
+     * 되지만, 판정 오차는 GDO0 ISR 지연/FreeRTOS 스케줄링 지터/잔여 클럭
+     * 드리프트까지 다 흡수해야 한다. 5ms는 이 지터 예산으론 타이트해서
+     * 실제로 패킷은 정상 수신됐는데 타이밍만 창을 벗어나 MISS로
+     * 판정되는(수신자가 RX를 놓치는) 사례가 실기기에서 확인됨 — 별도
+     * 필드로 분리해 더 넉넉하게 잡는다. */
+    uint32_t timing_window_margin_us;
+    uint32_t sync_offset_us;
+    uint32_t correction_deadband_us;
+    uint32_t correction_fast_threshold_us;
+    uint32_t correction_slow_divisor;
+    uint32_t correction_fast_divisor;
+    uint32_t correction_max_step_us;
+    uint32_t search_dwell_ms;
+    uint32_t receive_timeout_ms;
+    uint32_t acquire_count;
+    uint32_t loss_count;
+    /* Enter bounded N/N-1/N+1 probing at this many consecutive misses.
+     * Must be smaller than loss_count, which remains the hard reset limit. */
+    uint32_t recovery_entry_miss_count;
+    uint32_t diagnostics_interval_ms;
+    fhss_service_event_callback_t event_callback;
+    fhss_service_data_callback_t data_callback;
+    void *event_context;
+} fhss_service_config_t;
+
+typedef struct {
+    fhss_service_config_t config;
+    rf_transport_t radio;
+    fhss_sync_controller_t controller;
+    fhss_fsm_t fsm;
+    fhss_diagnostics_t diagnostics;
+    void *diagnostics_mutex;
+    void *tx_queue;
+    void *task_handle;
+    uint8_t current_channel;
+    uint32_t consecutive_sync_misses;
+    /* RX가 마지막으로 hop_sequence를 재구성한 기준 public_seed. 수신 SYNC의
+     * public_seed가 이 값과 다르면(새 세션 시작) derive_hop_seed로 다시
+     * 파생시켜 hop_sequence를 즉시 갱신한다. */
+    uint32_t last_derived_public_seed;
+    bool have_derived_public_seed;
+    /* A/B test counter used only when timestamp fault injection is enabled in
+     * fhss_service.c. It is kept per service so restarting a session resets
+     * the experiment deterministically. */
+    uint32_t test_tracking_sync_count;
+    uint8_t recovery_probe_index;
+    volatile bool tx_in_flight;
+    /* 재배정(2026-08-17): fhss_service_set_role()이 이전엔 task_handle을
+     * vTaskDelete()로 직접 강제 종료했는데, tx_task/rx_task가 SPI 전송
+     * 중간(CS 로우 구간 등)에 죽으면 CC1101/SPI 버스가 잠긴 상태로 남아
+     * 이후 모든 SPI 호출이 무한 대기하는 전체 행(hang)이 실기기에서
+     * 확인됨(짧은 PTT 세션에서 재현). tx_audio_task/rx_audio_task에 이미
+     * 쓰던 것과 같은 협조적 종료 플래그로 교체. */
+    volatile bool should_stop;
+    bool initialized;
+} fhss_service_t;
+
+bool fhss_service_init(
+    fhss_service_t *service,
+    const fhss_service_config_t *config
+);
+
+bool fhss_service_start(fhss_service_t *service);
+/* Cooperatively stops the service task and leaves the shared radio recovered
+ * and exclusively available to another mode such as fixed-channel OTA. */
+bool fhss_service_pause(fhss_service_t *service);
+bool fhss_service_set_role(
+    fhss_service_t *service,
+    fhss_service_role_t role
+);
+bool fhss_service_send_data(
+    fhss_service_t *service,
+    const uint8_t *data,
+    size_t length
+);
+bool fhss_service_wait_tx_idle(
+    fhss_service_t *service,
+    uint32_t timeout_ms
+);
+/* SYNC 패킷(ota_protocol 공유 포맷, generation만 실림)이 아니라 별도
+ * announce 패킷(fhss_audio_packet)으로 전달받은 public_seed를 반영한다 —
+ * 이미 파생된 값이면(직전과 동일) 아무 것도 안 하고 true를 반환한다.
+ * derive_hop_seed 콜백이 설정 안 됐으면 항상 false. */
+bool fhss_service_apply_public_seed(
+    fhss_service_t *service,
+    uint32_t public_seed
+);
+fhss_fsm_state_t fhss_service_get_state(const fhss_service_t *service);
+bool fhss_service_get_diagnostics(
+    fhss_service_t *service,
+    fhss_diagnostics_snapshot_t *out_snapshot
+);

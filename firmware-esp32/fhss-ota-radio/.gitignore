@@ -1,0 +1,89 @@
+# Editor / IDE (머신별 절대경로 포함 - VSCode ESP-IDF 확장이 idf.currentSetup, clangd.path 등을 여기 저장함)
+.vscode/
+.claude/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Directory metadata
+.directory
+
+# Temporary files
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# Log files
+*.log
+
+# Build artifacts and directories
+**/build/
+build/
+*.o
+*.a
+*.out
+*.exe # For any host-side utilities compiled on Windows
+
+# ESP-IDF specific build outputs
+*.bin
+*.elf
+*.map
+flasher_args.json # Generated in build directory
+sdkconfig.old
+sdkconfig
+
+# ESP-IDF dependencies
+# For older versions or manual component management
+/components/.idf/
+**/components/.idf/
+# For modern ESP-IDF component manager
+managed_components/
+# If ESP-IDF tools are installed/referenced locally to the project
+.espressif/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+
+# Python environment files
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.egg-info/
+dist/
+
+# Virtual environment folders
+venv/
+.venv/
+env/
+
+# Language Servers
+.clangd/
+.ccls-cache/
+compile_commands.json
+
+# Windows specific
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# User-specific configuration files
+*.user
+*.workspace # General workspace files, can be from various tools
+*.suo       # Visual Studio Solution User Options
+*.sln.docstates # Visual Studio
+
+# FHSS 팀 공유 비밀(HMAC-SHA256 hop_seed 파생용). EMBED_TXTFILES로 빌드에
+# 박혀서 커밋 대상이 아님 — components/fhss_audio_adapter/secret_seed.txt.example
+# 참고해서 각자 준비(README.md "빌드 전 준비" 참고). *.txt로 폴더째 무시해서
+# secret_seed.txt뿐 아니라 사본/백업 파일("secret_seed (사본).txt" 등)도
+# 실수로 커밋되지 않게 함 — .example은 확장자가 .txt가 아니라 안 걸림.
+/components/fhss_audio_adapter/*.txt
