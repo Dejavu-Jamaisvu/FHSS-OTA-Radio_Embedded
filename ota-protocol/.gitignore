@@ -1,0 +1,4 @@
+tests/test_ota_protocol
+*.o
+.DS_Store
+docs/note/
